@@ -449,11 +449,25 @@ class DatabaseManager:
         conn = self._get_connection()
         depth = getattr(self._local, 'transaction_depth', 0)
         savepoint = f'soundbot_batch_{depth}'
-        conn.execute(f'SAVEPOINT {savepoint}')
+        # A deferred transaction that reads before it writes must upgrade its
+        # read lock. While another connection holds the write lock, SQLite fails
+        # that upgrade at once instead of waiting out the busy timeout (deadlock
+        # avoidance), so take the write lock up front and let contention wait.
+        began = depth == 0 and not conn.in_transaction
+        if began:
+            conn.execute('BEGIN IMMEDIATE')
+        try:
+            conn.execute(f'SAVEPOINT {savepoint}')
+        except BaseException:
+            if began:
+                conn.rollback()
+            raise
         self._local.transaction_depth = depth + 1
         try:
             yield
             conn.execute(f'RELEASE {savepoint}')
+            if began:
+                conn.commit()
         except BaseException:
             # A failure committing RELEASE must be rolled back too. SQLite can
             # also auto-abort a transaction on I/O errors, losing savepoints.
@@ -461,6 +475,8 @@ class DatabaseManager:
                 try:
                     conn.execute(f'ROLLBACK TO {savepoint}')
                     conn.execute(f'RELEASE {savepoint}')
+                    if began:
+                        conn.rollback()
                 except sqlite3.Error:
                     conn.rollback()
             raise
