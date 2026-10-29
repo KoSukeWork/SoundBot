@@ -38,6 +38,21 @@ class AudioScannerTests(unittest.TestCase):
         self.assertTrue(scanner.is_audio_file('C:/声音/impact.WMA'))
         self.assertTrue(scanner.is_audio_file('/tmp/impact.aif'))
 
+    def test_collect_skips_macos_appledouble_sidecars(self) -> None:
+        scanner = AudioScanner(audio_service=FakeAudioService())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'sub').mkdir()
+            for name in ('boom.aiff', '._boom.aiff', 'sub/._hit.wav', 'sub/hit.wav', 'sub/.quiet.wav'):
+                (root / name).write_bytes(b'x')
+            recursive = [path.name for path in scanner.collect_audio_paths(temp_dir)]
+            flat = [path.name for path in scanner.collect_audio_paths(temp_dir, recursive=False)]
+            sidecar = scanner._process_file(root / '._boom.aiff')
+
+        self.assertEqual(sorted(recursive), ['.quiet.wav', 'boom.aiff', 'hit.wav'])
+        self.assertEqual(flat, ['boom.aiff'])
+        self.assertIsNone(sidecar)
+
     def test_scan_does_not_require_soundfile_info_before_service_probe(self) -> None:
         fake = FakeAudioService()
         scanner = AudioScanner(audio_service=fake)

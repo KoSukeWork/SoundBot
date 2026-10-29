@@ -100,13 +100,13 @@ class AudioScanner:
             for root, _dirs, files in os.walk(folder):
                 for filename in files:
                     file_path = Path(root) / filename
-                    if file_path.suffix.lower() in self.supported_formats:
+                    if self.is_audio_file(file_path):
                         paths.append(file_path.resolve(strict=False))
         else:
             paths.extend(
                 file_path.resolve(strict=False)
                 for file_path in folder.iterdir()
-                if file_path.is_file() and file_path.suffix.lower() in self.supported_formats
+                if file_path.is_file() and self.is_audio_file(file_path)
             )
         # A directory can expose the same file through multiple symlink aliases.
         # Keep one physical path so a single import job never processes it twice.
@@ -477,7 +477,7 @@ class AudioScanner:
         file_path = file_path.expanduser().resolve(strict=False)
 
         # 检查文件格式
-        if file_path.suffix.lower() not in self.supported_formats:
+        if not self.is_audio_file(file_path):
             return None
 
         try:
@@ -519,7 +519,10 @@ class AudioScanner:
         Returns:
             是否为支持的音频文件
         """
-        return Path(file_path).suffix.lower() in self.supported_formats
+        path = Path(file_path)
+        # macOS AppleDouble sidecars ("._name.wav") keep the audio suffix but
+        # hold only Finder metadata, so they would always fail to decode.
+        return path.suffix.lower() in self.supported_formats and not path.name.startswith('._')
 
 
 # 便捷函数
