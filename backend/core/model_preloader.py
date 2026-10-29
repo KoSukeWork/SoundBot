@@ -151,6 +151,7 @@ class ModelPreloader:
             "loading": self._loading,
             "error": str(self._error) if self._error else None,
             "fingerprint": getattr(self._embedder, "fingerprint", None),
+            "device": str(self._embedder.device) if self._embedder is not None else None,
         }
 
     def start(self) -> Optional[asyncio.Task]:

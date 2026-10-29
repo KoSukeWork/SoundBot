@@ -150,19 +150,23 @@ def collection_uses_cosine(collection: Any) -> bool:
 
 def collection_engine_fingerprints(collection: Any) -> Tuple[set[str], bool]:
     """Return every persisted engine fingerprint and whether any row lacks one."""
-    if int(collection.count()) <= 0:
+    count = int(collection.count())
+    if count <= 0:
         return set(), False
-    snapshot = collection.get(include=["metadatas"])
-    metadatas = snapshot.get("metadatas") or []
     fingerprints: set[str] = set()
     unknown = False
-    for metadata in metadatas:
-        fingerprint = str((metadata or {}).get("engine_fingerprint") or "").strip()
-        if fingerprint:
-            fingerprints.add(fingerprint)
-        else:
-            unknown = True
-    if len(metadatas) < int(collection.count()):
+    seen = 0
+    for offset in range(0, count, 1000):
+        snapshot = collection.get(include=["metadatas"], limit=1000, offset=offset)
+        metadatas = snapshot.get("metadatas") or []
+        seen += len(metadatas)
+        for metadata in metadatas:
+            fingerprint = str((metadata or {}).get("engine_fingerprint") or "").strip()
+            if fingerprint:
+                fingerprints.add(fingerprint)
+            else:
+                unknown = True
+    if seen < count:
         unknown = True
     return fingerprints, unknown
 
@@ -273,6 +277,8 @@ class AudioIndexer:
         fingerprint = str(fingerprint or "").strip()
         if not fingerprint:
             raise RuntimeError("CLAP engine fingerprint is missing")
+        if not self._unknown_engine_metadata and self._engine_fingerprints == {fingerprint}:
+            return  # Loaded once and maintained under the writer lock; avoid count per file.
         if int(self.collection.count()) > 0 and (
             self._unknown_engine_metadata
             or self._engine_fingerprints != {fingerprint}
@@ -470,15 +476,29 @@ class AudioIndexer:
         ``metadata['file_id']`` lets SQLite's project-local UUID become the
         vector ID. Without it, a normalized-path hash preserves compatibility.
         """
+        try:
+            row = self.prepare_audio(file_path, metadata)
+            if row is None:
+                return False
+            self.write_prepared_audio([row])
+            return True
+        except Exception as exc:
+            logger.error("添加文件向量失败 %s: %s", file_path, exc)
+            return False
+
+    def prepare_audio(
+        self, file_path: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Encode on the model worker; defer Chroma I/O until a bounded batch."""
         metadata = dict(metadata or {})
         try:
             if self.needs_rebuild:
                 logger.error("拒绝写入不兼容 collection；请先执行影子重建")
-                return False
+                return None
             embedder = get_embedder()
             if embedder is None:
                 logger.warning("CLAP 模型不可用，文件保持 pending: %s", file_path)
-                return False
+                return None
             self._ensure_engine_compatible(getattr(embedder, "fingerprint", ""))
             file_id = self._record_id(file_path, metadata)
             if metadata.get("filename"):
@@ -499,25 +519,35 @@ class AudioIndexer:
             else:
                 audio_info = AudioScanner()._process_file(Path(file_path))
                 if audio_info is None:
-                    return False
+                    return None
 
             row = self._generate_embedding_for_file(file_id, file_path, audio_info, embedder)
             if row is None:
-                return False
+                return None
             row["metadata"].update(_sanitize_metadata(metadata))
             row["metadata"]["file_path"] = file_path
             row["metadata"]["normalized_path"] = normalize_file_path(file_path)
-            with self._write_lock:
-                self._ensure_engine_compatible(embedder.fingerprint)
-                self.collection.upsert(
-                    ids=[file_id], embeddings=[row["embedding"]], metadatas=[row["metadata"]]
-                )
-                bump_collection_revision(self.persist_directory, self.collection_name)
-                self._record_engine_write(embedder.fingerprint)
-            return True
+            return row
         except Exception as exc:
             logger.error("添加文件向量失败 %s: %s", file_path, exc)
-            return False
+            return None
+
+    def write_prepared_audio(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
+        fingerprints = {row['metadata']['engine_fingerprint'] for row in rows}
+        if len(fingerprints) != 1:
+            raise RuntimeError('Cannot mix audio engines in one batch')
+        fingerprint = next(iter(fingerprints))
+        with self._write_lock:
+            self._ensure_engine_compatible(fingerprint)
+            self.collection.upsert(
+                ids=[row['file_id'] for row in rows],
+                embeddings=[row['embedding'] for row in rows],
+                metadatas=[row['metadata'] for row in rows],
+            )
+            bump_collection_revision(self.persist_directory, self.collection_name)
+            self._record_engine_write(fingerprint)
 
     def remove_audio(self, file_path: str, file_id: Optional[str] = None) -> bool:
         try:
@@ -729,6 +759,8 @@ class TextMetadataIndexer:
         fingerprint = str(fingerprint or "").strip()
         if not fingerprint:
             raise RuntimeError("text embedding engine fingerprint is missing")
+        if not self._unknown_engine_metadata and self._engine_fingerprints == {fingerprint}:
+            return
         if int(self.collection.count()) > 0 and (
             self._unknown_engine_metadata
             or self._engine_fingerprints != {fingerprint}
@@ -769,6 +801,16 @@ class TextMetadataIndexer:
         return str(self._provider().fingerprint)
 
     async def upsert_metadata(self, records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        rows = await self.prepare_metadata(records)
+        self.write_prepared_metadata(rows)
+        return {
+            "indexed": len(rows), "failed": 0,
+            "fingerprint": rows[0]['metadata']['engine_fingerprint'] if rows else None,
+            "needs_rebuild": self.needs_rebuild,
+        }
+
+    async def prepare_metadata(self, records: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """Separate inference failures from the batch's eventual storage commit."""
         if self.needs_rebuild:
             raise RuntimeError("文本 collection 使用旧距离度量，请先重建为 cosine")
         usable: List[Tuple[str, Dict[str, Any], str]] = []
@@ -782,7 +824,7 @@ class TextMetadataIndexer:
             file_id = str(explicit) if explicit else generate_file_id(path)
             usable.append((file_id, metadata, text))
         if not usable:
-            return {"indexed": 0, "failed": 0, "fingerprint": None}
+            return []
 
         provider = self._provider()
         self._ensure_engine_compatible(provider.fingerprint)
@@ -803,21 +845,25 @@ class TextMetadataIndexer:
                 }
             )
             metadatas.append(_sanitize_metadata(source))
+        return [dict(file_id=item[0], embedding=normalize_embedding(vector).tolist(), metadata=metadata)
+                for item, vector, metadata in zip(usable, vectors, metadatas)]
+
+    def write_prepared_metadata(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        if not rows:
+            return
+        fingerprints = {row['metadata']['engine_fingerprint'] for row in rows}
+        if len(fingerprints) != 1:
+            raise RuntimeError('Cannot mix text engines in one batch')
+        fingerprint = next(iter(fingerprints))
         with self._write_lock:
-            self._ensure_engine_compatible(provider.fingerprint)
+            self._ensure_engine_compatible(fingerprint)
             self.collection.upsert(
-                ids=[item[0] for item in usable],
-                embeddings=[normalize_embedding(vector).tolist() for vector in vectors],
-                metadatas=metadatas,
+                ids=[row['file_id'] for row in rows],
+                embeddings=[row['embedding'] for row in rows],
+                metadatas=[row['metadata'] for row in rows],
             )
             bump_collection_revision(self.persist_directory, self.collection_name)
-            self._record_engine_write(provider.fingerprint)
-        return {
-            "indexed": len(usable),
-            "failed": 0,
-            "fingerprint": provider.fingerprint,
-            "needs_rebuild": self.needs_rebuild,
-        }
+            self._record_engine_write(fingerprint)
 
     def remove(self, *, file_id: Optional[str] = None, file_path: Optional[str] = None) -> bool:
         if file_id:

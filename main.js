@@ -14,6 +14,11 @@ const audioCapabilityManifest = require('./config/audio_capabilities.json');
 const supportedAudioExtensions = new Set(Object.keys(audioCapabilityManifest.formats || {}));
 const supportedAudioFilterExtensions = [...supportedAudioExtensions].map((value) => value.slice(1));
 
+// Apply the override before logs, secrets, or Chromium touch userData.
+if (process.env.SOUNDBOT_USER_DATA_DIR) {
+  app.setPath('userData', path.resolve(process.env.SOUNDBOT_USER_DATA_DIR));
+}
+
 // 自定义协议：用于在渲染进程中安全加载本地音频
 const AUDIO_PROTOCOL = 'soundmind-audio';
 
@@ -565,14 +570,19 @@ async function startBackend() {
   }
 
   // 获取后端可执行文件
-  const backendExe = getBackendExecutable();
+  const sourcePython = !app.isPackaged && process.env.SOUNDBOT_PYTHON;
+  const backendExe = sourcePython ? path.resolve(sourcePython) : getBackendExecutable();
   if (!backendExe) {
     return { success: false, error: '未找到后端可执行文件' };
   }
 
   // 验证后端目录完整性
-  const backendDir = path.dirname(backendExe);
-  if (!verifyBackendIntegrity(backendDir)) {
+  const backendDir = sourcePython ? path.join(__dirname, 'backend') : path.dirname(backendExe);
+  const backendArgs = sourcePython ? [path.join(backendDir, 'main.py')] : [];
+  if (sourcePython && !fs.existsSync(backendExe)) {
+    return { success: false, error: `Python 环境不存在: ${backendExe}` };
+  }
+  if (!sourcePython && !verifyBackendIntegrity(backendDir)) {
     return { success: false, error: '后端文件不完整' };
   }
 
@@ -592,7 +602,7 @@ async function startBackend() {
 
   try {
     // 启动后端进程
-    backendProcess = spawn(backendExe, [], {
+    backendProcess = spawn(backendExe, backendArgs, {
       env,
       cwd: backendDir,
       stdio: ['pipe', 'pipe', 'pipe'],

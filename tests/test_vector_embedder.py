@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import types
+import threading
 import unittest
 from unittest import mock
 
@@ -31,6 +32,33 @@ from core.embedder import (
 
 
 class EmbedderPreprocessingTests(unittest.TestCase):
+    def test_text_truncation_respects_tokenizer_and_roberta_positions(self):
+        embedder = object.__new__(CLIPEmbedder)
+        embedder._inference_lock = threading.Lock()
+        embedder.device = "cpu"
+        embedder.processor = mock.Mock()
+        embedder.processor.return_value.to.return_value = {}
+        embedder.model = mock.Mock()
+        embedder.model.config.text_config = types.SimpleNamespace(
+            max_position_embeddings=514, pad_token_id=1,
+        )
+        embedder._output_vector = lambda _: np.array([1.0, 0.0])
+        for tokenizer_limit, expected in ((512, 512), (256, 256), (10**30, 512)):
+            embedder.processor.tokenizer.model_max_length = tokenizer_limit
+            embedder.text_to_embedding("long metadata " * 2000)
+            self.assertEqual(embedder.processor.call_args.kwargs["max_length"], expected)
+            self.assertIs(embedder.processor.call_args.kwargs["truncation"], True)
+
+    def test_device_does_not_change_engine_fingerprint(self):
+        embedder = object.__new__(CLIPEmbedder)
+        embedder._model_identity = embedder._model_name = "same-local-model"
+        embedder._model_revision = "same-revision"
+        embedder.sample_rate, embedder.max_samples = 48000, 480000
+        embedder.device = "cpu"
+        cpu = embedder._build_fingerprint()
+        embedder.device = "cuda"
+        self.assertEqual(cpu, embedder._build_fingerprint())
+
     def test_clap_text_provider_never_loads_model_on_async_construction(self):
         with (
             mock.patch.object(embedder_module, "peek_embedder", return_value=None),

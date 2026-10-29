@@ -363,12 +363,31 @@ class CLIPEmbedder:
             raise ValueError("文本不能为空")
         try:
             with self._inference_lock:
-                inputs = self.processor(text=[text], return_tensors="pt").to(self.device)
+                inputs = self.processor(
+                    text=[text], return_tensors="pt", truncation=True,
+                    max_length=self._text_max_length(),
+                ).to(self.device)
                 with torch.inference_mode():
                     outputs = self.model.get_text_features(**inputs)
             return self._output_vector(outputs)
         except Exception as exc:
             raise RuntimeError(f"[Embedder] 文本嵌入失败: {exc}") from exc
+
+    def _text_max_length(self) -> int:
+        """Respect both tokenizer limits and RoBERTa's padding position offset."""
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        text_config = getattr(getattr(self.model, "config", None), "text_config", None)
+        limits = []
+        tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+        if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000:
+            limits.append(tokenizer_limit)
+        positions = getattr(text_config, "max_position_embeddings", None)
+        padding = getattr(text_config, "pad_token_id", 1)
+        if isinstance(positions, int) and isinstance(padding, int):
+            limit = positions - padding - 1
+            if limit > 0:
+                limits.append(limit)
+        return min(limits) if limits else 512
 
     def get_embedding_dim(self) -> int:
         config_dim = getattr(getattr(self, "model", None), "config", None)

@@ -284,9 +284,13 @@ async def lifespan(app: FastAPI):
     def on_model_progress(stage: str, _progress: float) -> None:
         if stage == "complete" and not _shutting_down:
             event_loop.call_soon_threadsafe(_schedule_model_ready_reconcile)
+        elif stage == "error" and not _shutting_down:
+            event_loop.call_soon_threadsafe(_schedule_waveform_reconcile)
 
     preloader.add_progress_callback(on_model_progress)
     await preload_models_on_startup()
+    if not config.ENABLE_MODEL_PRELOAD:
+        _schedule_waveform_reconcile()
 
     yield
 
@@ -2363,11 +2367,17 @@ async def _run_automatic_reconcile(
     kinds: List[str],
 ) -> None:
     try:
-        await _repair_index_task(job_id, project_id, kinds, "reconcile")
+        await _repair_index_task(job_id, project_id, kinds, "resume")
     finally:
         current = _automatic_index_tasks.get(project_id)
         if current and current.get("job_id") == job_id:
             _automatic_index_tasks.pop(project_id, None)
+            followup = current.get("followup_kinds", set())
+            job = get_db_manager().get_job(job_id)
+            if followup and job and not job["cancel_requested"]:
+                _schedule_project_reconcile(
+                    project_id, sorted(followup), reason="model_ready"
+                )
 
 
 def _schedule_project_reconcile(
@@ -2390,25 +2400,36 @@ def _schedule_project_reconcile(
         return None
     current = _automatic_index_tasks.get(project_id)
     if current and not current["task"].done():
+        current.setdefault("followup_kinds", set()).update(
+            set(valid_kinds) - set(current["kinds"])
+        )
         return str(current["job_id"])
-    work = db_manager.list_artifacts_for_work(
-        project_id, valid_kinds, limit=100000
-    )
-    if not work:
+    total = db_manager.count_artifacts_for_work(project_id, valid_kinds)
+    if not total:
         return None
     job_id = db_manager.create_job(
-        project_id, f"index_auto_{reason}", len(work)
+        project_id, f"index_auto_{reason}", total
     )
     task = asyncio.create_task(
         _run_automatic_reconcile(job_id, project_id, valid_kinds),
         name=f"soundbot-index-{project_id}-{reason}",
     )
-    _automatic_index_tasks[project_id] = {"job_id": job_id, "task": task}
+    _automatic_index_tasks[project_id] = {
+        "job_id": job_id, "task": task, "kinds": valid_kinds,
+    }
     return job_id
 
 
+def _schedule_waveform_reconcile() -> None:
+    """A missing/broken model must not prevent waveform recovery."""
+    if _shutting_down:
+        return
+    for project in get_db_manager().get_all_projects():
+        _schedule_project_reconcile(str(project["id"]), ("waveform",), reason="startup")
+
+
 def _schedule_model_ready_reconcile() -> None:
-    """Backfill vector artifacts after a newly available CLAP model loads."""
+    """Resume all unfinished artifacts after CLAP becomes available."""
     if _shutting_down:
         return
     db_manager = get_db_manager()
@@ -2416,7 +2437,7 @@ def _schedule_model_ready_reconcile() -> None:
         project_id = str(project["id"])
         _schedule_project_reconcile(
             project_id,
-            ("audio_vector", "text_vector"),
+            ("waveform", "audio_vector", "text_vector"),
             reason="model_ready",
         )
 
@@ -2454,6 +2475,7 @@ async def get_project_index_status(project_id: str):
         "project_id": project_id,
         "total_files": db_manager.get_file_count(project_id),
         "artifacts": db_manager.get_artifact_counts(project_id),
+        "job": db_manager.get_index_job(project_id),
         "manifests": {
             kind: db_manager.get_index_manifest(project_id, kind) or {}
             for kind in ("audio_vector", "text_vector")
@@ -2504,21 +2526,16 @@ async def _start_index_job(
     if mode == "rebuild":
         total = 0
         if "waveform" in valid_kinds:
-            total += len(db_manager.list_artifacts_for_work(
-                project_id, ["waveform"], limit=100000
-            ))
+            total += db_manager.count_artifacts_for_work(project_id, ["waveform"])
         for kind in ("audio_vector", "text_vector"):
             if kind in valid_kinds:
-                total += len(db_manager.list_artifacts_for_work(
+                total += db_manager.count_artifacts_for_work(
                     project_id,
                     [kind],
                     states=("pending", "processing", "ready", "failed", "stale"),
-                    limit=100000,
-                ))
+                )
     else:
-        total = len(db_manager.list_artifacts_for_work(
-            project_id, valid_kinds, limit=100000
-        ))
+        total = db_manager.count_artifacts_for_work(project_id, valid_kinds)
     job_id = db_manager.create_job(project_id, f"index_{mode}", total)
     background_tasks.add_task(
         _repair_index_task, job_id, project_id, valid_kinds, mode
@@ -2572,20 +2589,18 @@ async def _repair_index_task_locked(
     folder_context = _load_logical_folder_context(project_id)
     db_manager.update_job(job_id, state="running", stage="reconciling")
     try:
-        records = db_manager.get_files_by_project(project_id)
-        expected = [
-            {
-                "file_id": record.file_uuid,
-                "file_path": record.path,
-                "source_fingerprint": record.source_fingerprint,
-            }
-            for record in records
-        ]
+        job = db_manager.get_job(job_id)
+        if _shutting_down or (job and job["cancel_requested"]):
+            db_manager.update_job(job_id, state="cancelled", stage="cancelled")
+            return
         vector_targets: Dict[str, Any] = {}
         shadow_kinds = set()
         if "audio_vector" in kinds:
-            active_audio = _get_active_audio_indexer(project_id)
-            needs_shadow = mode == "rebuild" or active_audio.get_manifest().get("needs_rebuild")
+            active_audio = await _run_model_work(_get_active_audio_indexer, project_id)
+            audio_manifest = await _run_model_work(active_audio.get_manifest)
+            needs_shadow = mode == "rebuild" or audio_manifest.get("needs_rebuild")
+            if needs_shadow and mode == "resume":
+                raise RuntimeError("Audio engine mismatch; explicit index rebuild required")
             if needs_shadow:
                 shadow_kinds.add("audio_vector")
                 vector_targets["audio_vector"] = create_shadow_indexer(
@@ -2594,8 +2609,11 @@ async def _repair_index_task_locked(
             else:
                 vector_targets["audio_vector"] = active_audio
         if "text_vector" in kinds:
-            active_text = _get_active_text_indexer(project_id)
-            needs_shadow = mode == "rebuild" or active_text.get_manifest().get("needs_rebuild")
+            active_text = await _run_model_work(_get_active_text_indexer, project_id)
+            text_manifest = await _run_model_work(active_text.get_manifest)
+            needs_shadow = mode == "rebuild" or text_manifest.get("needs_rebuild")
+            if needs_shadow and mode == "resume":
+                raise RuntimeError("Text engine mismatch; explicit index rebuild required")
             if needs_shadow:
                 shadow_kinds.add("text_vector")
                 vector_targets["text_vector"] = create_shadow_indexer(
@@ -2604,7 +2622,10 @@ async def _repair_index_task_locked(
             else:
                 vector_targets["text_vector"] = active_text
 
-        if mode != "rebuild":
+        # Startup trusts durable artifact states. Deep Chroma orphan repair is
+        # reserved for the explicit reconcile endpoint, not every restart.
+        if mode == "reconcile":
+            expected = db_manager.get_vector_reconcile_records(project_id)
             for kind, indexer in vector_targets.items():
                 if kind in shadow_kinds:
                     continue
@@ -2618,23 +2639,21 @@ async def _repair_index_task_locked(
                     db_manager.set_artifact_state(project_id, file_id, kind, "stale")
 
         direct_kinds = [kind for kind in kinds if kind not in shadow_kinds]
-        work = db_manager.list_artifacts_for_work(
-            project_id,
-            direct_kinds,
-            states=("pending", "failed", "stale"),
-            limit=100000,
-        )
+        work_groups = [(direct_kinds, ("pending", "failed", "stale"))]
         # A shadow must be a complete snapshot of all currently indexable
         # records, including rows whose old active vectors remain ready.
         # Reading ready rows here does not mutate their online artifact state.
         for kind in sorted(shadow_kinds):
-            work.extend(db_manager.list_artifacts_for_work(
-                project_id,
-                [kind],
-                states=("pending", "processing", "ready", "failed", "stale"),
-                limit=100000,
-            ))
-        db_manager.update_job(job_id, total=len(work), stage="processing")
+            work_groups.append(([kind], ("pending", "processing", "ready", "failed", "stale")))
+        total = sum(
+            db_manager.count_artifacts_for_work(project_id, group, states)
+            for group, states in work_groups
+        )
+        work = (
+            artifact for group, states in work_groups
+            for artifact in db_manager.iter_artifacts_for_work(project_id, group, states)
+        )
+        db_manager.update_job(job_id, total=total, processed=0, stage="processing")
         shadow_success: Dict[str, List[str]] = {
             kind: [] for kind in shadow_kinds
         }
@@ -2642,17 +2661,32 @@ async def _repair_index_task_locked(
             kind: {} for kind in shadow_kinds
         }
         shadow_candidate_counts = {
-            kind: sum(1 for artifact in work if artifact["kind"] == kind)
+            kind: db_manager.count_artifacts_for_work(
+                project_id, [kind], ("pending", "processing", "ready", "failed", "stale")
+            )
             for kind in shadow_kinds
         }
         failures: Dict[str, int] = {kind: 0 for kind in kinds}
+        if mode == "resume":
+            from core.index_resume import resume_artifacts
+
+            failures, cancelled = await resume_artifacts(
+                db_manager, project_id, job_id, kinds, vector_targets, service,
+                run_audio=_run_audio_work, run_model=_run_model_work,
+                build_text=lambda row: _build_text_metadata_payload(
+                    project_id, row["file_uuid"], row, tags=row["tags"],
+                    source_fingerprint=row["source_fingerprint"], folder_context=folder_context,
+                ),
+                model_available=is_embedder_available,
+                shutting_down=lambda: _shutting_down,
+            )
+            if cancelled:
+                return
+            work = ()
+        metadata_cache = {}
         for index, artifact in enumerate(work):
             job = db_manager.get_job(job_id)
-            if job and job["cancel_requested"]:
-                if artifact["kind"] not in shadow_kinds:
-                    db_manager.set_artifact_state(
-                        project_id, artifact["file_uuid"], artifact["kind"], "stale"
-                    )
+            if _shutting_down or (job and job["cancel_requested"]):
                 db_manager.update_job(
                     job_id, state="cancelled", stage="cancelled", processed=index
                 )
@@ -2661,11 +2695,25 @@ async def _repair_index_task_locked(
             file_uuid = artifact["file_uuid"]
             is_shadow = kind in shadow_kinds
             if not is_shadow:
-                db_manager.set_artifact_state(project_id, file_uuid, kind, "processing")
+                # A waveform request can finish a row after its page was read.
+                if not db_manager.claim_artifact_for_work(project_id, file_uuid, kind):
+                    db_manager.update_job(job_id, processed=index + 1, stage=kind)
+                    continue
             try:
+                from core.audio_metadata import metadata_missing, probe_metadata
+
+                if metadata_missing(artifact):
+                    # Pages contain copies of all three artifacts. Cache the
+                    # probe for this file so audio/text see it before waveform.
+                    if file_uuid not in metadata_cache:
+                        metadata_cache = {file_uuid: await _run_audio_work(
+                            probe_metadata, service, artifact["path"]
+                        )}
+                        db_manager.update_audio_metadata(project_id, file_uuid, metadata_cache[file_uuid])
+                    artifact.update(metadata_cache[file_uuid].to_dict())
                 if kind == "waveform":
                     waveform = await _run_audio_work(service.waveform, artifact["path"])
-                    db_manager.update_peaks(
+                    saved = db_manager.update_peaks(
                         artifact["path"],
                         waveform.peaks,
                         project_id,
@@ -2673,6 +2721,8 @@ async def _repair_index_task_locked(
                         waveform_fingerprint=waveform.fingerprint.key,
                         waveform_version=int(waveform.fingerprint.waveform_version),
                     )
+                    if not saved:
+                        raise RuntimeError("waveform could not be persisted")
                 elif kind == "audio_vector":
                     if not is_embedder_available():
                         outcome = {

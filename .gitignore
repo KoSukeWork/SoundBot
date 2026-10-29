@@ -106,6 +106,9 @@ __pycache__/
 *.so
 .Python
 .venv/
+.venv-gpu/
+.venv-gpu313/
+.test-data/
 env/
 venv/
 ENV/

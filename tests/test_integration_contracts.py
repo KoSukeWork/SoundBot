@@ -25,7 +25,7 @@ os.environ["SOUNDBOT_USER_DATA_DIR"] = _MODULE_DATA_DIR.name
 
 import config
 import main
-from core.audio_service import FileFingerprint, WaveformResult
+from core.audio_service import AudioMetadata, FileFingerprint, WaveformResult
 from core.database import AudioFileRecord, DatabaseManager
 from core.search_engine import OptimizedAudioSearcher
 from models import schemas
@@ -269,7 +269,9 @@ class ShadowRebuildContractTests(unittest.IsolatedAsyncioTestCase):
                 return_value=self.FakeActiveAudioIndexer(),
             ),
             mock.patch.object(main, "is_embedder_available", return_value=True),
-            mock.patch("core.audio_service.get_audio_service", return_value=mock.Mock()),
+            mock.patch("core.audio_service.get_audio_service", return_value=mock.Mock(
+                probe=mock.Mock(return_value=AudioMetadata(1.0, 48000, 1, 'wav')),
+            )),
             mock.patch(
                 "core.index_lifecycle.create_shadow_indexer",
                 return_value=shadow,
@@ -390,8 +392,8 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
             repair.assert_awaited_once()
             job_id, project_id, kinds, mode = repair.await_args.args
             self.assertEqual(project_id, "default")
-            self.assertEqual(kinds, ["audio_vector", "text_vector"])
-            self.assertEqual(mode, "reconcile")
+            self.assertEqual(kinds, ["waveform", "audio_vector", "text_vector"])
+            self.assertEqual(mode, "resume")
             self.assertEqual(manager.get_job(job_id)["kind"], "index_auto_model_ready")
 
     async def test_ai_config_route_never_returns_api_keys(self) -> None:

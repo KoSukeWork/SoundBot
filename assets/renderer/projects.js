@@ -70,6 +70,7 @@
             return api().get(`/api/v1/files?${query.toString()}`);
         },
         indexStatus: projectId => api().get(projectPath(projectId, '/index/status')),
+        cancelJob: jobId => api().delete(`/api/v1/jobs/${encodeURIComponent(jobId)}`),
         reconcileIndex: (projectId, kinds) => api().post(
             projectPath(projectId, '/index/reconcile'),
             { kinds }

@@ -430,12 +430,51 @@ class DatabaseManager:
         cursor = conn.cursor()
         try:
             yield cursor
-            conn.commit()
+            if not getattr(self._local, 'transaction_depth', 0):
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if not getattr(self._local, 'transaction_depth', 0):
+                conn.rollback()
             raise
         finally:
             cursor.close()
+
+    @contextmanager
+    def transaction(self):
+        """Group synchronous writes only; never hold this context over an await.
+
+        Nested callers use savepoints, so a caught inner failure cannot commit
+        half an operation. The existing journal and durability settings stay intact.
+        """
+        conn = self._get_connection()
+        depth = getattr(self._local, 'transaction_depth', 0)
+        savepoint = f'soundbot_batch_{depth}'
+        conn.execute(f'SAVEPOINT {savepoint}')
+        self._local.transaction_depth = depth + 1
+        try:
+            yield
+            conn.execute(f'RELEASE {savepoint}')
+        except BaseException:
+            # A failure committing RELEASE must be rolled back too. SQLite can
+            # also auto-abort a transaction on I/O errors, losing savepoints.
+            if conn.in_transaction:
+                try:
+                    conn.execute(f'ROLLBACK TO {savepoint}')
+                    conn.execute(f'RELEASE {savepoint}')
+                except sqlite3.Error:
+                    conn.rollback()
+            raise
+        finally:
+            self._local.transaction_depth = depth
+
+    def update_audio_metadata(self, project_id: str, file_uuid: str, metadata: Any) -> None:
+        """Persist original-stream properties without touching artifact readiness."""
+        with self.get_cursor() as cursor:
+            cursor.execute("""
+                UPDATE files SET duration=?, sample_rate=?, channels=?, updated_at=?
+                WHERE project_id=? AND file_uuid=?
+            """, (metadata.duration, metadata.sample_rate, metadata.channels,
+                  datetime.now().isoformat(), project_id, file_uuid))
 
     def _init_db(self):
         """Initialize safely, restoring the immutable snapshot on failure."""
@@ -1402,6 +1441,7 @@ class DatabaseManager:
         source_fingerprint: Optional[str] = None,
         waveform_fingerprint: Optional[str] = None,
         waveform_version: int = 1,
+        raise_errors: bool = False,
     ) -> bool:
         """
         更新波形峰值数据
@@ -1504,6 +1544,8 @@ class DatabaseManager:
             return changed
         except Exception as e:
             _get_logger().error(f"更新波形失败 {path}: {e}")
+            if raise_errors:
+                raise
             return False
 
     def update_tags(self, path: str, tags: List[str], project_id: str = None) -> bool:
@@ -1821,6 +1863,95 @@ class DatabaseManager:
         params = [project_id, *selected_kinds, *selected_states, max(1, min(limit, 100000))]
         with self.get_cursor() as cursor:
             return [dict(row) for row in cursor.execute(query, params).fetchall()]
+
+    def count_artifacts_for_work(
+        self, project_id: str, kinds: Iterable[str] = ARTIFACT_KINDS,
+        states: Iterable[str] = ("pending", "failed", "stale"),
+    ) -> int:
+        kinds, states = tuple(kinds), tuple(states)
+        if not kinds or not states:
+            return 0
+        with self.get_cursor() as cursor:
+            return int(cursor.execute(f"""
+                SELECT COUNT(*) FROM file_artifacts
+                WHERE project_id=? AND kind IN ({','.join('?' for _ in kinds)})
+                  AND state IN ({','.join('?' for _ in states)})
+            """, (project_id, *kinds, *states)).fetchone()[0])
+
+    def claim_artifact_for_work(self, project_id: str, file_uuid: str, kind: str) -> bool:
+        """Claim only unfinished work, atomically preserving concurrent ready rows."""
+        with self.get_cursor() as cursor:
+            cursor.execute("""
+                UPDATE file_artifacts SET state='processing', updated_at=?
+                WHERE project_id=? AND file_uuid=? AND kind=?
+                  AND state IN ('pending', 'failed', 'stale')
+            """, (datetime.now().isoformat(), project_id, file_uuid, kind))
+            return cursor.rowcount == 1
+
+    def iter_artifacts_for_work(
+        self, project_id: str, kinds: Iterable[str] = ARTIFACT_KINDS,
+        states: Iterable[str] = ("pending", "failed", "stale"),
+        batch_size: int = 500,
+    ):
+        """Visit each file once using indexed ID pages, never loading peaks.
+
+        A failed or deferred artifact is not selected again in the same pass.
+        No SQLite cursor/transaction is held while the caller processes a page.
+        Bound the pass at its starting high-water mark so concurrent additions
+        cannot make a job endless; their import job owns those new records.
+        """
+        kinds, states = tuple(kinds), tuple(states)
+        if not kinds or not states:
+            return
+        batch_size = max(1, min(batch_size, 1000))
+        with self.get_cursor() as cursor:
+            high_water = cursor.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM files WHERE project_id=?",
+                (project_id,),
+            ).fetchone()[0]
+        after_id = 0
+        while after_id < high_water:
+            with self.get_cursor() as cursor:
+                ids = cursor.execute("""
+                    SELECT id FROM files WHERE project_id=? AND id>? AND id<=?
+                    ORDER BY id LIMIT ?
+                """, (project_id, after_id, high_water, batch_size)).fetchall()
+                if not ids:
+                    return
+                last_id = ids[-1]["id"]
+                rows = cursor.execute(f"""
+                    SELECT f.file_uuid, f.path, f.filename, f.duration, f.sample_rate,
+                           f.channels, f.file_size, f.tags, f.source_fingerprint,
+                           a.kind, a.state, a.engine_fingerprint, a.error_code,
+                           a.error_message
+                    FROM files f CROSS JOIN file_artifacts a
+                    ON a.project_id=f.project_id AND a.file_uuid=f.file_uuid
+                    WHERE f.project_id=? AND f.id>? AND f.id<=?
+                      AND a.kind IN ({','.join('?' for _ in kinds)})
+                      AND a.state IN ({','.join('?' for _ in states)})
+                    ORDER BY f.id, a.kind
+                """, (project_id, after_id, last_id, *kinds, *states)).fetchall()
+            after_id = last_id
+            yield from (dict(row) for row in rows)
+
+    def get_index_job(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Expose the current (or most recent) durable index job to the UI."""
+        with self.get_cursor() as cursor:
+            row = cursor.execute("""
+                SELECT * FROM jobs WHERE project_id=? AND kind LIKE 'index_%'
+                ORDER BY CASE state WHEN 'running' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                         created_at DESC
+                LIMIT 1
+            """, (project_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_vector_reconcile_records(self, project_id: str) -> List[Dict[str, Any]]:
+        """Explicit deep repair needs identities, never stored waveform arrays."""
+        with self.get_cursor() as cursor:
+            return [dict(row) for row in cursor.execute("""
+                SELECT file_uuid AS file_id, path AS file_path, source_fingerprint
+                FROM files WHERE project_id=?
+            """, (project_id,)).fetchall()]
 
     def mark_project_artifacts(
         self, project_id: str, kinds: Iterable[str], state: str = "stale"

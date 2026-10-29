@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import io
 import json
 import os
 from pathlib import Path
@@ -77,6 +78,81 @@ class AudioServiceTests(unittest.TestCase):
         self.assertTrue(all(math.isfinite(value) for value in first.peaks))
         self.assertTrue(all(0.0 <= value <= 1.0 for value in first.peaks))
         self.assertEqual(first.fingerprint.waveform_version, WAVEFORM_VERSION)
+
+    @unittest.skipIf(audio_service_module._av is None, "PyAV is not installed")
+    def test_gbk_info_metadata_preserves_probe_waveform_and_clap_preprocessing(self) -> None:
+        from core.embedder import CLIPEmbedder
+        from transformers import ClapFeatureExtractor
+
+        tagged = self.root / 'gbk-info.wav'
+        raw = self.source.read_bytes()
+        value = '测试音效'.encode('gbk') + b'\0'
+        info = b'INFO' + b'INAM' + struct.pack('<I', len(value)) + value
+        info += b'\0' * (len(value) % 2)
+        body = raw[8:] + b'LIST' + struct.pack('<I', len(info)) + info
+        tagged.write_bytes(b'RIFF' + struct.pack('<I', len(body)) + body)
+        # Prove this fixture exercises the former strict-text decoding failure.
+        with self.assertRaises(UnicodeDecodeError):
+            with audio_service_module._av.open(io.BytesIO(tagged.read_bytes()), metadata_errors='strict'):
+                pass
+
+        service = AudioService(self.cache)
+        self.assertEqual(service.probe(tagged), service.probe(self.source))
+        self.assertEqual(service.waveform(tagged).peaks, service.waveform(self.source).peaks)
+        decoded = service.decode(tagged, target_sample_rate=48000, mono=True)
+        self.assertEqual((decoded.sample_rate, decoded.channels), (48000, 1))
+        self.assertTrue(np.isfinite(decoded.samples).all())
+
+        # Real decode/resampling and CLAP feature extraction; no model weights,
+        # GPU environment or inference are needed for this preprocessing contract.
+        embedder = object.__new__(CLIPEmbedder)
+        embedder.sample_rate = 48000
+        embedder.max_samples = 480000
+        embedder.device = 'cpu'
+        extractor = ClapFeatureExtractor()
+        embedder.processor = lambda audio, **kwargs: extractor(audio, **kwargs)
+        embedder._process_audio_segment = embedder._processor_inputs
+        with mock.patch('core.audio_service.get_audio_service', return_value=service):
+            tagged_inputs = embedder.audio_to_embedding(str(tagged))
+            clean_inputs = embedder.audio_to_embedding(str(self.source))
+        features = tagged_inputs['input_features'].numpy()
+        self.assertTrue(np.isfinite(features).all())
+        np.testing.assert_array_equal(features, clean_inputs['input_features'].numpy())
+
+    @unittest.skipIf(audio_service_module._av is None, "PyAV is not installed")
+    def test_metadata_tolerance_does_not_hide_corrupt_audio(self) -> None:
+        from core.embedder import CLIPEmbedder
+
+        service = AudioService(self.cache)
+        broken_header = self.root / 'broken-header.wav'
+        broken_header.write_bytes(b'not a WAV container')
+        with self.assertRaises(AudioServiceError) as caught:
+            service.probe(broken_header)
+        self.assertEqual(caught.exception.code, 'audio_probe_failed')
+
+        # A valid PCM header with an incomplete 16-bit sample: a real codec
+        # error, distinct from invalid ancillary text or a missing container.
+        broken_pcm = self.root / 'broken-pcm.wav'
+        fmt = struct.pack('<HHIIHH', 1, 1, 8000, 16000, 2, 16)
+        body = b'WAVEfmt ' + struct.pack('<I',len(fmt)) + fmt + b'data' + struct.pack('<I',1) + b'\xff'
+        broken_pcm.write_bytes(b'RIFF' + struct.pack('<I',len(body)) + body)
+        for source in (broken_header, broken_pcm):
+            with self.subTest(source=source.name):
+                with self.assertRaises(AudioServiceError) as caught:
+                    service.decode(source, target_sample_rate=48000, mono=True)
+                self.assertEqual(caught.exception.code, 'audio_decode_failed')
+                with self.assertRaises(AudioServiceError) as caught:
+                    service.waveform(source)
+                self.assertEqual(caught.exception.code, 'waveform_decode_failed')
+                embedder = object.__new__(CLIPEmbedder)
+                embedder.sample_rate = 48000
+                embedder.max_samples = 480000
+                embedder._process_audio_segment = mock.Mock(side_effect=AssertionError('inference must not run'))
+                with mock.patch('core.audio_service.get_audio_service', return_value=service):
+                    with self.assertRaises(RuntimeError) as caught:
+                        embedder.audio_to_embedding(str(source))
+                self.assertIsInstance(caught.exception.__cause__, AudioServiceError)
+                embedder._process_audio_segment.assert_not_called()
 
     def test_pyav_decoder_is_preferred_and_fallback_is_not_called(self) -> None:
         service = AudioService(self.cache)

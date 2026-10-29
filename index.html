@@ -241,7 +241,8 @@
                         style="border-color: var(--border-color);" title="只修复缺失或过期项">修复缺失项</button>
                 <button id="rebuildIndexBtn" class="px-2 py-0.5 rounded border hover:bg-black/5 dark:hover:bg-white/5"
                         style="border-color: var(--border-color);" title="完整重建当前工程索引">完整重建</button>
-                <span id="indexJobStatus" class="max-w-32 truncate opacity-60"></span>
+                <span id="indexJobStatus" class="max-w-64 truncate opacity-60"></span>
+                <button id="cancelIndexJobBtn" class="hidden text-xs opacity-70" onclick="cancelCurrentIndexJob()">暂停索引</button>
             </div>
 
             <!-- 磁盘空间显示 -->
@@ -782,7 +783,7 @@
                         modelIcon.className = 'w-3.5 h-3.5 flex items-center justify-center';
                         modelIcon.style.border = 'none';
                         modelIcon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px;"><polyline points="20 6 9 17 4 12"></polyline></svg>';
-                        modelText.textContent = i18n.t('model.ready');
+                        modelText.textContent = i18n.t('model.ready') + (result.model_status.device === 'cuda' ? ' · GPU' : '');
                         modelText.style.color = '#22c55e';
                         modelDisplay.style.borderColor = '#22c55e';
                     } else if (result.model_status.error) {
@@ -816,6 +817,7 @@
         }
 
         let indexJobRunning = false;
+        let currentIndexJobId = null;
 
         function formatIndexArtifactStatus(summary) {
             return `R${summary.ready} P${summary.pending} F${summary.failed}`;
@@ -827,13 +829,32 @@
             const total = Number(job?.total || 0);
             const processed = Number(job?.processed || 0);
             const progress = total > 0 ? ` ${processed}/${total}` : '';
-            status.textContent = `${job?.state || 'pending'}${progress}`;
-            status.title = job?.error_message || job?.stage || status.textContent;
+            status.textContent = job ? `${job.state || 'pending'}${progress}` : '';
+            status.title = `${status.textContent} ${job?.error_message || job?.stage || ''}`.trim();
+            const active = ['pending', 'running'].includes(job?.state);
+            currentIndexJobId = active ? job.id || job.job_id : null;
+            const cancel = document.getElementById('cancelIndexJobBtn');
+            if (cancel) cancel.classList.toggle('hidden', !active);
+            for (const id of ['reconcileIndexBtn', 'rebuildIndexBtn']) {
+                const button = document.getElementById(id);
+                if (button) button.disabled = active || indexJobRunning;
+            }
+        }
+
+        async function cancelCurrentIndexJob() {
+            if (!currentIndexJobId) return;
+            try {
+                await rendererProjects.cancelJob(currentIndexJobId);
+                showNotification('正在暂停；当前文件处理完后停止，下次启动会自动继续。', 'info');
+            } catch (error) {
+                showNotification('暂停失败: ' + error.message, 'error');
+            }
         }
 
         async function refreshProjectIndexStatus() {
             try {
                 const status = await rendererProjects.indexStatus(currentProject?.id || 'default');
+                if (!indexJobRunning) updateIndexJobStatus(status.job);
                 const audio = rendererProjects.artifactSummary(status, 'audio_vector');
                 const text = rendererProjects.artifactSummary(status, 'text_vector');
                 const audioElement = document.getElementById('audioIndexStatus');
@@ -870,7 +891,7 @@
                     : await rendererProjects.reconcileIndex(currentProject.id, kinds);
                 updateIndexJobStatus(job);
                 const completed = await rendererProjects.waitForJob(job.job_id, {
-                    onUpdate: updateIndexJobStatus
+                    onUpdate: updateIndexJobStatus, timeoutMs: Infinity
                 });
                 if (completed.state === 'completed') {
                     showNotification(mode === 'rebuild' ? '索引完整重建完成' : '索引缺失项修复完成', 'success');

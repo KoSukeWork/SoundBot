@@ -1,0 +1,4 @@
+# Windows source-run environment: Python 3.13, CUDA 12.8, Blackwell sm_120.
+# Use with uv pip install -r requirements.txt --overrides this-file.
+# Keep the release/CPU lock unchanged; GPU compatibility is verified separately.
+torch==2.8.0+cu128
