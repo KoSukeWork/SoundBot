@@ -37,6 +37,29 @@ class DatabaseV2Tests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_keyword_rows_come_from_a_covering_index_without_peaks(self) -> None:
+        database_path = self.root / "keyword.db"
+        manager = DatabaseManager(str(database_path))
+        audio = self.root / "door slam.wav"
+        audio.write_bytes(b"RIFF-test")
+        manager.upsert_file(AudioFileRecord(path=str(audio), filename=audio.name), "default")
+        rows = manager.get_keyword_search_rows("default")
+        self.assertEqual([row["filename"] for row in rows], ["door slam.wav"])
+        self.assertNotIn("peaks_json", rows[0].keys())
+        connection = manager._get_connection()
+        try:
+            connection.execute("DROP INDEX idx_files_keyword")
+            connection.commit()
+            # Existing libraries get the index on the next start, without a migration.
+            manager._init_db_once()
+            plan = connection.execute("""EXPLAIN QUERY PLAN
+                SELECT file_uuid, path, filename, duration, sample_rate, channels, file_size, tags
+                FROM files WHERE project_id = ? ORDER BY created_at DESC""", ("default",)).fetchall()
+        finally:
+            connection.close()
+            manager._local.conn = None
+        self.assertIn("COVERING INDEX idx_files_keyword", " ".join(str(step[-1]) for step in plan))
+
     def test_fresh_database_creates_artifact_state_and_metadata_page(self) -> None:
         manager = DatabaseManager(str(self.root / "fresh.db"))
         audio = self.root / "中文 %_ tone.wav"

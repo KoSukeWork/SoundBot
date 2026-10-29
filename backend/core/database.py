@@ -581,6 +581,14 @@ class DatabaseManager:
                     updated_at=?
                 WHERE state IN ('pending', 'running')
             """, (now,))
+            # Keyword search reads these columns for every file. peaks_json
+            # precedes tags in each row, so without a covering index SQLite
+            # walks ~40 KB of waveform overflow per file (a minute at 835k).
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_files_keyword ON files(
+                    project_id, created_at, file_uuid, path, filename, duration,
+                    sample_rate, channels, file_size, tags)
+            """)
             if schema_version_pending:
                 # This must be the final write in the schema transaction.  A
                 # failed migration must never advertise the new version.
@@ -2425,6 +2433,15 @@ class DatabaseManager:
                 SELECT * FROM files WHERE project_id = ? ORDER BY created_at DESC
             """, (project_id,))
             return [self._row_to_record(row) for row in cursor.fetchall()]
+
+    def get_keyword_search_rows(self, project_id: str) -> List[sqlite3.Row]:
+        """Keyword-search columns only, never waveform peaks (idx_files_keyword covers it)."""
+        with self.get_cursor() as cursor:
+            return cursor.execute("""
+                SELECT file_uuid, path, filename, duration, sample_rate, channels,
+                       file_size, tags
+                FROM files WHERE project_id = ? ORDER BY created_at DESC
+            """, (project_id,)).fetchall()
 
     def add_file_with_project(self, record: AudioFileRecord, project_id: str = 'default') -> bool:
         """

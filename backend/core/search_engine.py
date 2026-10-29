@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import hashlib
 import threading
+from bisect import bisect_right
 from pathlib import Path
 
 import config
@@ -55,6 +56,75 @@ from core.searcher import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _searchable_tags(raw_metadata_tags: Any) -> List[Any]:
+    """Tag values that keyword matching compares against (JSON text or objects)."""
+    try:
+        metadata_tags = (
+            json.loads(raw_metadata_tags)
+            if isinstance(raw_metadata_tags, str) and raw_metadata_tags.strip()
+            else raw_metadata_tags
+        )
+    except (TypeError, json.JSONDecodeError):
+        metadata_tags = raw_metadata_tags
+    if isinstance(metadata_tags, dict):
+        return [*metadata_tags.keys(), *metadata_tags.values()]
+    if isinstance(metadata_tags, (list, tuple, set)):
+        return list(metadata_tags)
+    if metadata_tags:
+        return [metadata_tags]
+    return []
+
+
+class KeywordCandidates:
+    """Files a keyword term can match, found with C-level substring search.
+
+    _keyword_match_score scores a file above zero only when the lowercased term
+    or one of its tokens occurs in the file's lowercased filename, description,
+    folder, parsed name or tags. Scoring every file in Python took minutes per
+    search at 835k files; scoring just these candidates gives the same results.
+    """
+
+    def __init__(self, files: List[Dict[str, Any]]):
+        parts: List[str] = []
+        starts: List[int] = []
+        offset = 0
+        for metadata in files:
+            fields = [
+                str(metadata.get(key, "") or "").lower()
+                for key in ("filename", "name_description", "folder_path", "parsed_name")
+            ]
+            fields.extend(
+                str(value).lower()
+                for value in _searchable_tags(metadata.get("metadata_tags", {}))
+            )
+            text = "\x00".join(fields) + "\n"
+            starts.append(offset)
+            parts.append(text)
+            offset += len(text)
+        self._text = "".join(parts)
+        self._starts = starts
+
+    def indices(self, query: str) -> List[int]:
+        query_lower = query.lower().strip()
+        if not query_lower:
+            return []
+        needles = {query_lower}
+        needles.update(t.strip() for t in re.split(r'[_\-\s]+', query_lower) if t.strip())
+        if any("\x00" in needle or "\n" in needle for needle in needles):
+            return list(range(len(self._starts)))
+        text, starts = self._text, self._starts
+        found = set()
+        for needle in needles:
+            position = text.find(needle)
+            while position >= 0:
+                row = bisect_right(starts, position) - 1
+                found.add(row)
+                if row + 1 >= len(starts):
+                    break
+                position = text.find(needle, starts[row + 1])
+        return sorted(found)
 
 
 @dataclass
@@ -328,23 +398,7 @@ class OptimizedAudioSearcher(AudioSearcher):
                 match_level = "weak"
 
         # 4. 元数据标签匹配（ID3标签、BWF标签等）
-        raw_metadata_tags = metadata.get("metadata_tags", {})
-        try:
-            metadata_tags = (
-                json.loads(raw_metadata_tags)
-                if isinstance(raw_metadata_tags, str) and raw_metadata_tags.strip()
-                else raw_metadata_tags
-            )
-        except (TypeError, json.JSONDecodeError):
-            metadata_tags = raw_metadata_tags
-        if isinstance(metadata_tags, dict):
-            searchable_tags = [*metadata_tags.keys(), *metadata_tags.values()]
-        elif isinstance(metadata_tags, (list, tuple, set)):
-            searchable_tags = list(metadata_tags)
-        elif metadata_tags:
-            searchable_tags = [metadata_tags]
-        else:
-            searchable_tags = []
+        searchable_tags = _searchable_tags(metadata.get("metadata_tags", {}))
         if any(query_lower in str(value).lower() for value in searchable_tags):
             scores.append(0.75)
             if match_level == "none":
@@ -373,28 +427,29 @@ class OptimizedAudioSearcher(AudioSearcher):
             db_manager = get_db_manager()
             
             # 获取当前工程的文件记录，避免关键词搜索跨工程串数据
-            all_records = db_manager.get_files_by_project(self.project_id)
-            
+            # Loading full records would also load every waveform (~40 KB each).
+            all_records = db_manager.get_keyword_search_rows(self.project_id)
+
             # 转换为与 ChromaDB 元数据兼容的格式
             all_files = []
             for record in all_records:
                 # 从 filename 提取格式（扩展名）
-                filename = record.filename
+                filename = record["filename"]
                 file_ext = filename.split('.')[-1].lower() if '.' in filename else ""
-                
+
                 metadata = {
-                    "file_id": record.file_uuid,
-                    "file_path": record.path,
+                    "file_id": record["file_uuid"],
+                    "file_path": record["path"],
                     "filename": filename,
-                    "duration": record.duration,
+                    "duration": record["duration"],
                     "format": file_ext,
-                    "size": record.file_size,
-                    "sample_rate": record.sample_rate,
-                    "channels": record.channels,
+                    "size": record["file_size"],
+                    "sample_rate": record["sample_rate"],
+                    "channels": record["channels"],
                     "folder_path": "",  # SQLite 中没有这个字段
                     "parsed_name": "",  # SQLite 中没有这个字段
                     "name_description": "",  # SQLite 中没有这个字段
-                    "metadata_tags": record.tags,  # 使用 tags 字段
+                    "metadata_tags": record["tags"],  # 使用 tags 字段
                 }
                 
                 # 应用过滤条件
@@ -473,6 +528,7 @@ class OptimizedAudioSearcher(AudioSearcher):
         query: str,
         filters: Optional[Dict[str, Any]] = None,
         files_snapshot: Optional[List[Dict[str, Any]]] = None,
+        candidates: Optional[KeywordCandidates] = None,
     ) -> List[SearchResult]:
         """
         第1层：精确关键词搜索
@@ -486,9 +542,11 @@ class OptimizedAudioSearcher(AudioSearcher):
             return []
 
         all_files = files_snapshot if files_snapshot is not None else self._get_all_files(filters)
+        candidates = candidates or KeywordCandidates(all_files)
         results = []
 
-        for metadata in all_files:
+        for index in candidates.indices(query):
+            metadata = all_files[index]
             filename = metadata.get("filename", "")
             keyword_score, match_level = self._keyword_match_score(query, filename, metadata)
 
@@ -523,6 +581,7 @@ class OptimizedAudioSearcher(AudioSearcher):
         filters: Optional[Dict[str, Any]] = None,
         files_snapshot: Optional[List[Dict[str, Any]]] = None,
         expanded_queries: Optional[List[str]] = None,
+        candidates: Optional[KeywordCandidates] = None,
     ) -> List[SearchResult]:
         """
         第2层：分词扩展搜索
@@ -549,6 +608,7 @@ class OptimizedAudioSearcher(AudioSearcher):
             # 不再直接返回空列表，而是继续使用原始查询进行搜索
 
         all_files = files_snapshot if files_snapshot is not None else self._get_all_files(filters)
+        candidates = candidates or KeywordCandidates(all_files)
         results = []
 
         # 使用集合跟踪已处理的文件，避免重复
@@ -557,11 +617,12 @@ class OptimizedAudioSearcher(AudioSearcher):
         for expanded_query in expanded_queries:
             # 对于英文单词等没有扩展的查询，也需要搜索原始查询
             is_original = expanded_query.lower() == query.lower()
-            
+
             # 不再跳过原始查询，确保原始查询的精确匹配结果被包含
             # 即使与第1层有重复，后续会去重并保留最高分数
 
-            for metadata in all_files:
+            for index in candidates.indices(expanded_query):
+                metadata = all_files[index]
                 file_path = metadata.get("file_path", "")
 
                 # 避免重复处理同一文件
@@ -616,14 +677,16 @@ class OptimizedAudioSearcher(AudioSearcher):
         if query not in expanded_queries:
             expanded_queries.insert(0, query)
         files_snapshot = self._get_all_files(filters)
+        candidates = KeywordCandidates(files_snapshot)
         exact_results = self._exact_keyword_search(
-            query, filters, files_snapshot=files_snapshot
+            query, filters, files_snapshot=files_snapshot, candidates=candidates
         )
         expanded_results = self._expanded_keyword_search(
             query,
             filters,
             files_snapshot=files_snapshot,
             expanded_queries=expanded_queries,
+            candidates=candidates,
         )
         return expanded_queries, exact_results, expanded_results
 

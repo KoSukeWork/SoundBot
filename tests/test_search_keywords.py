@@ -43,7 +43,7 @@ class KeywordTagTests(unittest.TestCase):
         self.assertEqual((score, level), (0.0, "none"))
 
     def test_sqlite_snapshot_exposes_stable_file_uuid(self) -> None:
-        record = SimpleNamespace(
+        record = dict(
             file_uuid="stable-file-uuid",
             path="/sounds/explosion.wav",
             filename="explosion.wav",
@@ -54,13 +54,14 @@ class KeywordTagTests(unittest.TestCase):
             tags=["impact"],
         )
         manager = mock.Mock()
-        manager.get_files_by_project.return_value = [record]
+        manager.get_keyword_search_rows.return_value = [record]
+        manager.get_files_by_project.side_effect = AssertionError("loads waveform peaks")
         searcher = OptimizedAudioSearcher.__new__(OptimizedAudioSearcher)
         searcher.project_id = "project-one"
         with mock.patch("core.database.get_db_manager", return_value=manager):
             snapshot = searcher._get_all_files()
         self.assertEqual(snapshot[0]["file_id"], "stable-file-uuid")
-        manager.get_files_by_project.assert_called_once_with("project-one")
+        manager.get_keyword_search_rows.assert_called_once_with("project-one")
 
     def test_chroma_query_id_overrides_legacy_metadata_id(self) -> None:
         collection = mock.Mock()
@@ -105,6 +106,47 @@ class KeywordTagTests(unittest.TestCase):
 
         self.assertEqual([item.metadata["file_id"] for item in filtered], ["ready-id"])
         manager.get_ready_artifact_ids.assert_called_once()
+
+
+class KeywordCandidateTests(unittest.TestCase):
+    def test_candidates_cover_every_file_the_full_scan_would_score(self) -> None:
+        files = [
+            {"filename": "Door_Slam_01.wav", "metadata_tags": "[]"},
+            {"filename": "wind gust.WAV", "metadata_tags": '["Explosion", "门"]'},
+            {"filename": "a.mp3", "metadata_tags": {"category": "Door"}},
+            {"filename": "unrelated.wav", "folder_path": "SFX/Wind", "parsed_name": "door"},
+            {"filename": "x.wav", "name_description": "glass break", "metadata_tags": "["},
+            {"filename": "İstanbul street.flac", "metadata_tags": None},
+            {"filename": "track 1.wav"},
+        ]
+        searcher = OptimizedAudioSearcher.__new__(OptimizedAudioSearcher)
+        candidates = search_engine_module.KeywordCandidates(files)
+        for query in ["door slam", "wind", "explosion", "门", "door", "glass-break",
+                      "istanbul", "İstanbul", "track_1", " ", "", "x\ny", "wav"]:
+            with self.subTest(query=query):
+                scored = [
+                    index for index, metadata in enumerate(files)
+                    if searcher._keyword_match_score(
+                        query, metadata.get("filename", ""), metadata
+                    )[1] != "none"
+                ]
+                self.assertLessEqual(set(scored), set(candidates.indices(query)))
+
+    def test_snapshot_search_scores_only_candidates(self) -> None:
+        files = [{"filename": f"file_{i}.wav", "file_path": f"/s/{i}.wav"} for i in range(50)]
+        files[7]["filename"] = "Explosion_big.wav"
+        searcher = OptimizedAudioSearcher.__new__(OptimizedAudioSearcher)
+        scored = []
+        original = OptimizedAudioSearcher._keyword_match_score
+
+        def counting(self, query, filename, metadata):
+            scored.append(filename)
+            return original(self, query, filename, metadata)
+
+        with mock.patch.object(OptimizedAudioSearcher, "_keyword_match_score", counting):
+            results = searcher._exact_keyword_search("explosion", files_snapshot=files)
+        self.assertEqual([r.filename for r in results], ["Explosion_big.wav"])
+        self.assertEqual(scored, ["Explosion_big.wav"])
 
 
 class AsyncKeywordSnapshotTests(unittest.IsolatedAsyncioTestCase):
