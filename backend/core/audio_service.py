@@ -239,11 +239,12 @@ class AudioService:
         stat = source.stat()
         return FileFingerprint(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
 
-    def probe(self, path: os.PathLike[str] | str) -> AudioMetadata:
+    def probe(self, path: os.PathLike[str] | str, *, container=None) -> AudioMetadata:
         source = self._validate_source(path)
         self._require_pyav()
         try:
-            return self._probe_with_pyav(source)
+            return (self._metadata_from_container(source, container) if container is not None
+                    else self._probe_with_pyav(source))
         except Exception as exc:
             raise AudioServiceError(
                 'audio_probe_failed',
@@ -504,29 +505,33 @@ class AudioService:
         # Legacy WAV tags may contain GBK or arbitrary non-UTF-8 bytes. This
         # relaxes text decoding only; container/audio errors still propagate.
         with _av.open(str(source), mode='r', metadata_errors='replace') as container:
-            stream = next((item for item in container.streams if item.type == 'audio'), None)
-            if stream is None:
-                raise ValueError('container has no audio stream')
-            context = stream.codec_context
-            sample_rate = int(getattr(context, 'sample_rate', 0) or getattr(stream, 'rate', 0) or 0)
-            channels = int(getattr(context, 'channels', 0) or 0)
-            if not channels and getattr(stream, 'layout', None) is not None:
-                channels = len(stream.layout.channels)
-            duration = 0.0
-            if stream.duration is not None and stream.time_base is not None:
-                duration = float(stream.duration * stream.time_base)
-            elif container.duration is not None:
-                duration = float(container.duration / _av.time_base)
-            codec = getattr(context, 'name', '') or ''
-            if sample_rate < 1 or channels < 1:
-                raise ValueError('audio stream has incomplete channel or sample-rate metadata')
-            return AudioMetadata(
-                duration=max(0.0, duration),
-                sample_rate=sample_rate,
-                channels=channels,
-                format=source.suffix.lower().lstrip('.'),
-                codec=codec,
-            )
+            return AudioService._metadata_from_container(source, container)
+
+    @staticmethod
+    def _metadata_from_container(source: Path, container) -> AudioMetadata:
+        stream = next((item for item in container.streams if item.type == 'audio'), None)
+        if stream is None:
+            raise ValueError('container has no audio stream')
+        context = stream.codec_context
+        sample_rate = int(getattr(context, 'sample_rate', 0) or getattr(stream, 'rate', 0) or 0)
+        channels = int(getattr(context, 'channels', 0) or 0)
+        if not channels and getattr(stream, 'layout', None) is not None:
+            channels = len(stream.layout.channels)
+        duration = 0.0
+        if stream.duration is not None and stream.time_base is not None:
+            duration = float(stream.duration * stream.time_base)
+        elif container.duration is not None:
+            duration = float(container.duration / _av.time_base)
+        codec = getattr(context, 'name', '') or ''
+        if sample_rate < 1 or channels < 1:
+            raise ValueError('audio stream has incomplete channel or sample-rate metadata')
+        return AudioMetadata(
+            duration=max(0.0, duration),
+            sample_rate=sample_rate,
+            channels=channels,
+            format=source.suffix.lower().lstrip('.'),
+            codec=codec,
+        )
 
     @staticmethod
     def _decode_with_pyav(

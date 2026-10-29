@@ -8,10 +8,11 @@ def metadata_missing(record):
                for key in ('duration', 'sample_rate', 'channels'))
 
 
-def probe_metadata(service, path):
+def probe_metadata(service, path, *, container=None):
     from core.audio_service import AudioMetadata, AudioServiceError
 
-    metadata = service.probe(path)
+    metadata = (service.probe(path) if container is None
+                else service.probe(path, container=container))
     # Some containers omit duration in their header. Decode only that case,
     # keeping the source sample rate/channel count (never CLAP's mono rate).
     if metadata_missing(metadata.to_dict()):

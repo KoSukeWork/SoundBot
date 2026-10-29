@@ -458,6 +458,32 @@ class CLIPEmbedder:
                 limits.append(limit)
         return min(limits) if limits else 512
 
+    def texts_to_embeddings(self, texts):
+        """Bounded FP32 text batches with the single-text truncation limit."""
+        texts = [str(text or '').strip() for text in texts]
+        if any(not text for text in texts):
+            raise ValueError('文本不能为空')
+        if not texts:
+            return []
+        if len(texts) > 8:
+            return [v for start in range(0, len(texts), 8)
+                    for v in self.texts_to_embeddings(texts[start:start + 8])]
+        try:
+            with self._inference_lock, torch.inference_mode():
+                inputs = self.processor(text=texts, return_tensors='pt', padding=True,
+                                        truncation=True, max_length=self._text_max_length()).to(self.device)
+                outputs = self.model.get_text_features(**inputs)
+                tensor = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs
+                return [normalize_embedding(v) for v in tensor.detach().cpu().numpy()]
+        except torch.OutOfMemoryError:
+            inputs = outputs = tensor = None
+            if len(texts) == 1:
+                raise
+            if str(self.device).startswith('cuda'):
+                torch.cuda.empty_cache()
+        middle = len(texts) // 2
+        return self.texts_to_embeddings(texts[:middle]) + self.texts_to_embeddings(texts[middle:])
+
     def get_embedding_dim(self) -> int:
         config_dim = getattr(getattr(self, "model", None), "config", None)
         dim = getattr(config_dim, "projection_dim", 512)
@@ -488,8 +514,9 @@ class CLAPTextEmbeddingProvider:
         return f"clap-text:{self.embedder.fingerprint}"
 
     async def embed_texts(self, texts: List[str]) -> List[np.ndarray]:
-        # CLAP has one shared inference lock; sequential calls avoid scheduling
-        # competing model forwards while still keeping the event loop free.
+        if isinstance(self.embedder, CLIPEmbedder):
+            return await asyncio.to_thread(self.embedder.texts_to_embeddings, texts)
+        # Compatibility for external embedder adapters implementing one text.
         result: List[np.ndarray] = []
         for text in texts:
             vector = await asyncio.to_thread(self.embedder.text_to_embedding, text)

@@ -49,6 +49,34 @@ class EmbedderPreprocessingTests(unittest.TestCase):
             self.assertEqual(embedder.processor.call_args.kwargs["max_length"], expected)
             self.assertIs(embedder.processor.call_args.kwargs["truncation"], True)
 
+    def test_text_batches_are_bounded_split_oom_and_keep_order(self):
+        import torch
+        embedder = object.__new__(CLIPEmbedder)
+        embedder._inference_lock = threading.RLock()
+        embedder.device = 'cpu'
+        embedder._text_max_length = lambda: 128
+        calls = []
+        class Batch(dict):
+            def to(self, device):
+                return self
+        def processor(**kwargs):
+            self.assertEqual(kwargs['max_length'], 128)
+            self.assertTrue(kwargs['truncation'])
+            self.assertTrue(kwargs['padding'])
+            return Batch(input_ids=torch.tensor([[int(t), 1.] for t in kwargs['text']]))
+        def forward(input_ids):
+            calls.append(len(input_ids))
+            if len(input_ids) > 2:
+                raise torch.OutOfMemoryError('injected pressure')
+            return input_ids
+        embedder.processor = processor
+        embedder.model = types.SimpleNamespace(get_text_features=forward)
+        result = embedder.texts_to_embeddings([str(i) for i in range(17)])
+        self.assertLessEqual(max(calls), 8)
+        np.testing.assert_allclose(result, [normalize_embedding([i, 1.]) for i in range(17)], atol=1e-7)
+        with self.assertRaisesRegex(ValueError, '文本不能为空'):
+            embedder.texts_to_embeddings(['1', '  '])
+
     def test_device_does_not_change_engine_fingerprint(self):
         embedder = object.__new__(CLIPEmbedder)
         embedder._model_identity = embedder._model_name = "same-local-model"

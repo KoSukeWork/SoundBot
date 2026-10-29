@@ -49,6 +49,18 @@ async def _resume_with_pool(db, project_id, job_id, kinds, targets, service, *,
     from core.embedder import CLIPEmbedder, peek_embedder
     from core.index_audio import DecodePool, default_parallelism
     from core.indexer import AudioIndexer
+    embedder = peek_embedder()
+    if (isinstance(service, AudioService) and isinstance(embedder, CLIPEmbedder)
+            and isinstance(targets.get('audio_vector'), AudioIndexer)
+            and type(getattr(getattr(embedder, 'processor', None), 'feature_extractor', None)).__name__ == 'ClapFeatureExtractor'
+            and model_available()
+            and os.getenv('SOUNDBOT_DECODE_PROCESSES', str(default_parallelism())) != '0'
+            and os.getenv('SOUNDBOT_FAST_MEL', '1') != '0'
+            and os.getenv('SOUNDBOT_CONTINUOUS_INDEX', '1') != '0'):
+        from core.index_pipeline import resume_continuous
+        return await resume_continuous(db, project_id, job_id, kinds, targets, service,
+            embedder=embedder, run_audio=run_audio, run_model=run_model,
+            build_text=build_text, model_available=model_available, shutting_down=shutting_down)
     pool = None
     if (isinstance(service, AudioService) and isinstance(peek_embedder(), CLIPEmbedder)
             and isinstance(targets.get('audio_vector'), AudioIndexer)

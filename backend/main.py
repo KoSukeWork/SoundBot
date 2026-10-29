@@ -1112,6 +1112,13 @@ def _load_logical_folder_context(project_id: str) -> List[Dict[str, Any]]:
     )
 
 
+@functools.lru_cache(maxsize=8192)
+def _normalized_ucs_term(term: str):
+    normalized = " ".join(token for token in re.split(
+        r"[^0-9a-z\u3400-\u9fff]+", term.casefold()) if token)
+    return normalized, bool(re.search(r"[\u3400-\u9fff]", normalized))
+
+
 def _derive_ucs_metadata(values: Sequence[Any]) -> Dict[str, Any]:
     """Derive UCS categories and their synonyms from filename/user metadata."""
     from core.ucs_keywords import get_ucs_keywords
@@ -1124,19 +1131,14 @@ def _derive_ucs_metadata(values: Sequence[Any]) -> Dict[str, Any]:
         token for token in re.split(r"[^0-9a-z\u3400-\u9fff]+", corpus) if token
     )
     corpus_tokens = set(normalized_corpus.split())
+    compact_corpus = normalized_corpus.replace(" ", "")
 
     def matches(term: str) -> bool:
-        normalized = " ".join(
-            token
-            for token in re.split(
-                r"[^0-9a-z\u3400-\u9fff]+", str(term).casefold()
-            )
-            if token
-        )
+        normalized, chinese = _normalized_ucs_term(str(term))
         if not normalized:
             return False
-        if re.search(r"[\u3400-\u9fff]", normalized):
-            return normalized.replace(" ", "") in normalized_corpus.replace(" ", "")
+        if chinese:
+            return normalized.replace(" ", "") in compact_corpus
         if " " not in normalized:
             return normalized in corpus_tokens
         return f" {normalized} " in f" {normalized_corpus} "

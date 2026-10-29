@@ -331,12 +331,13 @@ class AudioIndexer:
 
     def _generate_embedding_for_file(
         self, file_id: str, file_path: str, audio_file: Any, embedder: Any,
-        prepared_audio=None, cancel=None,
+        prepared_audio=None, cancel=None, embedding=None,
     ) -> Optional[Dict[str, Any]]:
         try:
             embedding = normalize_embedding(
-                embedder.prepared_audio_to_embedding(prepared_audio, cancel)
-                if prepared_audio is not None else embedder.audio_to_embedding(file_path))
+                embedding if embedding is not None else (
+                    embedder.prepared_audio_to_embedding(prepared_audio, cancel)
+                    if prepared_audio is not None else embedder.audio_to_embedding(file_path)))
             metadata = _sanitize_metadata(
                 {
                     "file_path": file_path,
@@ -494,7 +495,7 @@ class AudioIndexer:
 
     def prepare_audio(
         self, file_path: str, metadata: Optional[Dict[str, Any]] = None,
-        *, prepared_audio=None, cancel=None,
+        *, prepared_audio=None, cancel=None, embedding=None,
     ) -> Optional[Dict[str, Any]]:
         """Encode on the model worker; defer Chroma I/O until a bounded batch."""
         metadata = dict(metadata or {})
@@ -518,7 +519,7 @@ class AudioIndexer:
                 audio_info.sample_rate = metadata.get("sample_rate", 0)
                 audio_info.channels = metadata.get("channels", 0)
                 audio_info.format = metadata.get("format", Path(file_path).suffix.lstrip("."))
-                audio_info.size = metadata.get("size", os.path.getsize(file_path))
+                audio_info.size = metadata["size"] if "size" in metadata else os.path.getsize(file_path)
                 audio_info.folder_path = metadata.get("folder_path", str(Path(file_path).parent))
                 audio_info.parsed_name = metadata.get("parsed_name", "")
                 audio_info.name_description = metadata.get("name_description", "")
@@ -529,7 +530,7 @@ class AudioIndexer:
                     return None
 
             row = self._generate_embedding_for_file(file_id, file_path, audio_info, embedder,
-                                                     prepared_audio, cancel)
+                                                     prepared_audio, cancel, embedding)
             if row is None:
                 return None
             row["metadata"].update(_sanitize_metadata(metadata))
@@ -537,6 +538,9 @@ class AudioIndexer:
             row["metadata"]["normalized_path"] = normalize_file_path(file_path)
             return row
         except Exception as exc:
+            from core.index_audio import IndexWorkCancelled
+            if isinstance(exc, IndexWorkCancelled):
+                raise
             logger.error("添加文件向量失败 %s: %s", file_path, exc)
             return None
 
