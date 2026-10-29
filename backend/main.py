@@ -1086,7 +1086,7 @@ def _flatten_metadata_values(value: Any) -> List[str]:
     return [str(value)]
 
 
-def _load_logical_folder_context(project_id: str) -> List[Dict[str, Any]]:
+def _load_logical_folder_context(project_id: str) -> Sequence[Mapping[str, Any]]:
     """Snapshot imported mappings and their user-facing folder metadata."""
     db_manager = get_db_manager()
     folders = {
@@ -1105,23 +1105,18 @@ def _load_logical_folder_context(project_id: str) -> List[Dict[str, Any]]:
         })
     # Longest ancestor wins when an import root and one of its nested folders
     # are both present in the mapping table.
-    return sorted(
+    from core.index_text import FolderContext
+    return FolderContext(sorted(
         context,
         key=lambda item: len(str(item.get("canonical_path") or "")),
         reverse=True,
-    )
-
-
-@functools.lru_cache(maxsize=8192)
-def _normalized_ucs_term(term: str):
-    normalized = " ".join(token for token in re.split(
-        r"[^0-9a-z\u3400-\u9fff]+", term.casefold()) if token)
-    return normalized, bool(re.search(r"[\u3400-\u9fff]", normalized))
+    ))
 
 
 def _derive_ucs_metadata(values: Sequence[Any]) -> Dict[str, Any]:
     """Derive UCS categories and their synonyms from filename/user metadata."""
     from core.ucs_keywords import get_ucs_keywords
+    from core.index_text import ucs_matcher
 
     flattened: List[str] = []
     for value in values:
@@ -1130,39 +1125,7 @@ def _derive_ucs_metadata(values: Sequence[Any]) -> Dict[str, Any]:
     normalized_corpus = " ".join(
         token for token in re.split(r"[^0-9a-z\u3400-\u9fff]+", corpus) if token
     )
-    corpus_tokens = set(normalized_corpus.split())
-    compact_corpus = normalized_corpus.replace(" ", "")
-
-    def matches(term: str) -> bool:
-        normalized, chinese = _normalized_ucs_term(str(term))
-        if not normalized:
-            return False
-        if chinese:
-            return normalized.replace(" ", "") in compact_corpus
-        if " " not in normalized:
-            return normalized in corpus_tokens
-        return f" {normalized} " in f" {normalized_corpus} "
-
-    categories: List[str] = []
-    keywords: List[str] = []
-    seen_keywords = set()
-    for category, synonyms in get_ucs_keywords().items():
-        if not (matches(category) or any(matches(synonym) for synonym in synonyms)):
-            continue
-        categories.append(str(category))
-        for synonym in synonyms:
-            rendered = str(synonym).strip()
-            identity = rendered.casefold()
-            if rendered and identity not in seen_keywords:
-                seen_keywords.add(identity)
-                keywords.append(rendered)
-    return {
-        "categories": categories,
-        "keywords": keywords,
-        # build_metadata_text consumes this field, so include both the UCS
-        # labels and their searchable synonyms in a deterministic string.
-        "search_text": " ".join([*categories, *keywords]),
-    }
+    return ucs_matcher(get_ucs_keywords()).match(normalized_corpus)
 
 
 def _build_text_metadata_payload(
@@ -1187,8 +1150,9 @@ def _build_text_metadata_payload(
         parsed_name = parsed_name or derived
         name_description = name_description or derived
 
-    context = list(folder_context) if folder_context is not None else _load_logical_folder_context(project_id)
-    logical = next(
+    from core.index_text import FolderContext
+    context = folder_context if folder_context is not None else _load_logical_folder_context(project_id)
+    logical = context.find(file_path) if isinstance(context, FolderContext) else next(
         (
             item for item in context
             if item.get("user_folder_id")

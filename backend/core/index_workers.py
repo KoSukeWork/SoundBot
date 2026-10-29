@@ -3,6 +3,7 @@ import multiprocessing
 import queue
 import time
 import os
+import threading
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
@@ -103,6 +104,63 @@ def _prepare(file_id, path, work_dir, rate, audio, waveform, need_metadata):
     return result
 
 
+class FeatureReceiver:
+    """Drain IPC during inference, with bounded local storage and joined exit."""
+    def __init__(self, source, cancel, capacity=64):
+        self.source, self.cancel = source, cancel
+        self.buffer = queue.Queue(maxsize=capacity)
+        self.done = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._receive, name='index-feature-receive')
+        self.thread.start()
+
+    def _receive(self):
+        while not self.done.is_set():
+            try:
+                entry = self.source.get(timeout=.05)
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                self.error = exc
+                # A malformed message must fail the consumer, but keep draining
+                # subsequent messages so the workers' feeders can still exit.
+                self.done.wait(.02)
+                continue
+            # After cancellation/error keep draining IPC until workers join.
+            while self.error is None and not self.cancel.is_set() and not self.done.is_set():
+                try:
+                    self.buffer.put(entry, timeout=.02)
+                    break
+                except queue.Full:
+                    pass
+
+    def read_batch(self, size):
+        if self.error is not None:
+            raise RuntimeError('Feature receiver failed') from self.error
+        if self.cancel.is_set():
+            return []
+        try:
+            first = self.buffer.get(timeout=.05)
+        except queue.Empty:
+            return []
+        result = [first]
+        # A 4ms ceiling avoids excessive one-window forwards on bursty input;
+        # unlike the old 40ms IPC wait, reception continues during inference.
+        deadline = time.monotonic() + .004
+        while len(result) < size:
+            try:
+                result.append(self.buffer.get(timeout=max(0., deadline - time.monotonic())))
+            except queue.Empty:
+                break
+        return result
+
+    def close(self):
+        self.done.set()
+        self.thread.join()
+        while not self.buffer.empty():
+            self.buffer.get_nowait()
+
+
 class FeaturePool:
     """At most workers source reads and 32 feature windows in transport.
 
@@ -122,6 +180,7 @@ class FeaturePool:
                        context.RawArray('d', spec.filters.reshape(-1)), spec.filters.shape)
         self.pool = ProcessPoolExecutor(max_workers=workers, mp_context=context,
             initializer=_initialize, initargs=(self.cancel, self.features, shared_spec, spool_limit))
+        self.receiver = FeatureReceiver(self.features, self.cancel)
 
     def submit(self, file_id, path, service, rate, *, audio, waveform, need_metadata):
         check_cancel(self.cancel)
@@ -129,38 +188,15 @@ class FeaturePool:
                                 rate, audio, waveform, need_metadata)
 
     def read_batch(self, size):
-        """Collect only already-ready features with a short coalescing window."""
-        result = []
-        deadline = time.monotonic() + .05
-        while len(result) < size and not self.cancel.is_set():
-            try:
-                result.append(self.features.get(timeout=max(.0001, deadline - time.monotonic())))
-                if len(result) == 1:
-                    deadline = time.monotonic() + .04
-            except queue.Empty:
-                break
-            if time.monotonic() >= deadline:
-                break
-        return result
+        return self.receiver.read_batch(size)
 
     def close(self):
         self.cancel.set()
-        # Keep draining while joining: a worker's Queue feeder can otherwise
-        # wait forever on a full pipe after the GPU consumer has stopped.
-        import threading
-        done = threading.Event()
-        def drain():
-            while not done.is_set():
-                try:
-                    self.features.get(timeout=.05)
-                except queue.Empty:
-                    pass
-        thread = threading.Thread(target=drain, name='index-feature-drain')
-        thread.start()
+        # The receiver keeps draining while joining, including after the GPU
+        # consumer stops. A full multiprocessing pipe must not block its feeder.
         try:
             self.pool.shutdown(wait=True, cancel_futures=True)
         finally:
-            done.set()
-            thread.join()
+            self.receiver.close()
             self.features.close()
             self.features.join_thread()

@@ -198,6 +198,9 @@ class CLIPEmbedder:
                 )
                 self.model.to(self.device)
                 self.model.eval()
+                if os.getenv('SOUNDBOT_CACHE_ATTN_MASKS', '1') != '0':
+                    from core.clap_masks import cache_attention_masks
+                    cache_attention_masks(self.model)
                 self.processor = ClapProcessor.from_pretrained(
                     str(model_path), local_files_only=True
                 )

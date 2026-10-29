@@ -25,7 +25,7 @@ from core.audio_service import AudioService, AudioMetadata, WaveformResult, File
 from core.audio_metadata import probe_metadata
 from core.index_audio import prepare_index_audio, IndexWorkCancelled
 from core.index_features import FeatureSpec, window_features
-from core.index_workers import FeaturePool
+from core.index_workers import FeaturePool, FeatureReceiver
 from core.index_pipeline import resume_continuous
 from core.database import DatabaseManager, AudioFileRecord
 
@@ -56,6 +56,37 @@ class FeatureTests(unittest.TestCase):
             actual=window_features(audio,spec)
             old=window_inputs(audio,e.processor.feature_extractor,480000)['input_features'].numpy()
             np.testing.assert_array_equal(actual,old)
+
+    def test_receiver_drains_during_paused_inference_and_bounds_local_storage(self):
+        source=queue.Queue(maxsize=2);cancel=threading.Event()
+        receiver=FeatureReceiver(source,cancel,capacity=4)
+        def produce():
+            for i in range(12):source.put(i,timeout=3)
+        producer=threading.Thread(target=produce);producer.start()
+        try:
+            deadline=time.monotonic()+2
+            while receiver.buffer.qsize()<4:
+                self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+            self.assertTrue(producer.is_alive())
+            self.assertEqual(receiver.buffer.qsize(),4)
+            received=[]
+            while len(received)<12:
+                received.extend(receiver.read_batch(3))
+                self.assertLess(time.monotonic(),deadline)
+            producer.join();self.assertEqual(received,list(range(12)))
+        finally:cancel.set();receiver.close();producer.join()
+        self.assertFalse(receiver.thread.is_alive())
+
+    def test_receiver_error_is_propagated_instead_of_hanging_file_tasks(self):
+        source=mock.Mock();source.get.side_effect=OSError('broken transport')
+        receiver=FeatureReceiver(source,threading.Event())
+        deadline=time.monotonic()+1
+        while receiver.error is None:
+            self.assertLess(time.monotonic(),deadline);time.sleep(.005)
+        try:
+            with self.assertRaisesRegex(RuntimeError,'Feature receiver failed'):
+                receiver.read_batch(16)
+        finally:receiver.close()
 
     def test_shared_container_metadata_matches_probe_field_by_field_with_one_open(self):
         from core import index_audio
@@ -129,7 +160,7 @@ class FeatureTests(unittest.TestCase):
 
     def test_full_feature_queue_can_cancel_without_feeder_deadlock(self):
         spec=FeatureSpec.from_embedder(spec_embedder());spec.max_samples=48000
-        service=AudioService(self.root/'cache');path=make_wave(self.root,seconds=60)
+        service=AudioService(self.root/'cache');path=make_wave(self.root,seconds=120)
         pool=FeaturePool(1,spec)
         try:
             future=pool.submit('file',str(path),service,48000,audio=True,waveform=True,need_metadata=True)
@@ -188,7 +219,7 @@ class MemoryPool:
                             self.features.put((file_id,index,np.array([[[[n+1.,index+1.,1.]]]],dtype=np.float32)),timeout=.01)
                             count+=1;break
                         except queue.Full:pass
-            return dict(metadata=metadata,waveform=(WaveformResult([n/100]*2000,.2,48000,FileFingerprint(1,n))
+            return dict(metadata=metadata,waveform=(WaveformResult([(n%100)/100]*2000,.2,48000,FileFingerprint(1,n))
                 if waveform and not error else None),windows=count,decode_error=error,feature_error=None,cancelled=self.cancel.is_set())
         return self.pool.submit(work)
     def read_batch(self,size):
@@ -224,7 +255,7 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
     async def run_job(self):
         def factory(*args):
             self.pool=MemoryPool(*args);self.configure(self.pool);return self.pool
-        with mock.patch.dict(os.environ,{'SOUNDBOT_PIPELINE_FILES':'32','SOUNDBOT_DECODE_PROCESSES':'4'}):
+        with mock.patch.dict(os.environ,{'SOUNDBOT_PIPELINE_FILES':getattr(self,'pipeline_files','32'),'SOUNDBOT_DECODE_PROCESSES':'4'}):
             return await resume_continuous(self.db,'default',self.job,['waveform','audio_vector','text_vector'],self.targets,
                 AudioService(self.root/'cache'),embedder=self.e,run_audio=asyncio.to_thread,run_model=asyncio.to_thread,
                 build_text=lambda r:dict(r),model_available=lambda:True,shutting_down=lambda:self.shutdown,pool_factory=factory)
@@ -261,6 +292,32 @@ class ContinuousTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failures,{'waveform':1,'audio_vector':3,'text_vector':1})
         self.assertEqual(len(self.audio),37);self.assertEqual(len(self.text),39)
         self.assertTrue(all(v['processing']==0 for v in self.db.get_artifact_counts('default').values()))
+
+    async def test_larger_publications_keep_claims_bounded_during_blocked_writer(self):
+        self.pipeline_files='128'
+        for n in range(40,200):
+            path=make_wave(self.root,f'{n}.wav')
+            self.ids.append(self.db.upsert_file(AudioFileRecord(path=str(path),filename=path.name)))
+        entered=threading.Event();release=threading.Event();sizes=[]
+        original=self.targets['audio_vector'].write_prepared_audio
+        def write(rows):
+            sizes.append(len(rows))
+            if len(sizes)==1:
+                entered.set();release.wait(3)
+            original(rows)
+        self.targets['audio_vector'].write_prepared_audio=write
+        with mock.patch.dict(os.environ,{'SOUNDBOT_PUBLISH_FILES':'64'}):
+            task=asyncio.create_task(self.run_job())
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait,3))
+                await asyncio.sleep(.1)
+                self.assertLessEqual(len(self.pool.started),128)
+                self.assertGreaterEqual(len(self.pool.started),64)
+            finally:release.set()
+            failures,cancelled=await asyncio.wait_for(task,5)
+        self.assertFalse(cancelled);self.assertEqual(sum(failures.values()),0)
+        self.assertEqual(len(self.audio),200)
+        self.assertEqual(max(sizes),64)
 
     async def test_text_batch_failure_isolated_and_ready_rows_not_recomputed(self):
         original=self.targets['text_vector'].prepare_metadata

@@ -276,14 +276,17 @@ class AudioIndexer:
             raise RuntimeError("CLAP engine fingerprint is missing")
         if not self._unknown_engine_metadata and self._engine_fingerprints == {fingerprint}:
             return  # Loaded once and maintained under the writer lock; avoid count per file.
-        if int(self.collection.count()) > 0 and (
-            self._unknown_engine_metadata
-            or self._engine_fingerprints != {fingerprint}
-        ):
-            self.needs_rebuild = True
-            raise RuntimeError(
-                "CLAP engine fingerprint changed; active collection requires shadow rebuild"
-            )
+        # First publication changes count before it records the engine cache.
+        # Preparation must not observe that intermediate writer-owned state.
+        with self._write_lock:
+            if int(self.collection.count()) > 0 and (
+                self._unknown_engine_metadata
+                or self._engine_fingerprints != {fingerprint}
+            ):
+                self.needs_rebuild = True
+                raise RuntimeError(
+                    "CLAP engine fingerprint changed; active collection requires shadow rebuild"
+                )
 
     def _refresh_engine_state(self) -> None:
         self._engine_fingerprints, self._unknown_engine_metadata = (
@@ -773,15 +776,16 @@ class TextMetadataIndexer:
             raise RuntimeError("text embedding engine fingerprint is missing")
         if not self._unknown_engine_metadata and self._engine_fingerprints == {fingerprint}:
             return
-        if int(self.collection.count()) > 0 and (
-            self._unknown_engine_metadata
-            or self._engine_fingerprints != {fingerprint}
-        ):
-            self.needs_rebuild = True
-            raise RuntimeError(
-                "text embedding engine fingerprint changed; active collection "
-                "requires shadow rebuild"
-            )
+        with self._write_lock:
+            if int(self.collection.count()) > 0 and (
+                self._unknown_engine_metadata
+                or self._engine_fingerprints != {fingerprint}
+            ):
+                self.needs_rebuild = True
+                raise RuntimeError(
+                    "text embedding engine fingerprint changed; active collection "
+                    "requires shadow rebuild"
+                )
 
     def _record_engine_write(self, fingerprint: str) -> None:
         self._engine_fingerprints = {str(fingerprint)}

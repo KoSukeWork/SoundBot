@@ -147,6 +147,8 @@ hiddenimports += [
     'core.index_pipeline',
     'core.index_workers',
     'core.index_features',
+    'core.index_text',
+    'core.clap_masks',
     'core.scanner',
     'core.searcher',
     'core.search_engine',

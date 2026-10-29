@@ -29,8 +29,9 @@ logger = logging.getLogger(__name__)
 async def resume_continuous(db, project_id, job_id, kinds, targets, service, *,
                             embedder, run_audio, run_model, build_text,
                             model_available, shutting_down, pool_factory=FeaturePool):
-    workers = max(1, min(4, int(os.getenv('SOUNDBOT_DECODE_PROCESSES', str(default_parallelism())))))
-    limit = max(workers, min(64, int(os.getenv('SOUNDBOT_PIPELINE_FILES', '64'))))
+    workers = max(1, min(8, int(os.getenv('SOUNDBOT_DECODE_PROCESSES', str(default_parallelism())))))
+    limit = max(workers, min(128, int(os.getenv('SOUNDBOT_PIPELINE_FILES', '128'))))
+    publish_size = max(1, min(limit, 128, int(os.getenv('SOUNDBOT_PUBLISH_FILES', '64'))))
     batch_size = max(1, min(16, int(os.getenv('SOUNDBOT_CLAP_BATCH_SIZE', '16'))))
     pool = pool_factory(workers, FeatureSpec.from_embedder(embedder))
     stop = pool.cancel
@@ -290,7 +291,7 @@ async def resume_continuous(db, project_id, job_id, kinds, targets, service, *,
                     return
                 items.append(item)
                 deadline = loop.time() + .5
-                while len(items) < 32:
+                while len(items) < publish_size:
                     try:
                         item = await asyncio.wait_for(completed.get(), max(.001, deadline - loop.time()))
                     except asyncio.TimeoutError:

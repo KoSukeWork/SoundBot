@@ -8,7 +8,7 @@ def main():
     import argparse,asyncio,json,os,sys,time,tempfile,threading,subprocess,statistics
     from pathlib import Path
     from collections import defaultdict
-    p=argparse.ArgumentParser();p.add_argument('--source',type=Path,required=True);p.add_argument('--label',required=True);p.add_argument('--samples',type=Path,required=True);p.add_argument('--models',type=Path,required=True);p.add_argument('--missing-metadata',action='store_true');p.add_argument('--warm-batches',action='store_true');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--source',type=Path,required=True);p.add_argument('--label',required=True);p.add_argument('--samples',type=Path,required=True);p.add_argument('--models',type=Path,required=True);p.add_argument('--missing-metadata',action='store_true');p.add_argument('--warm-batches',action='store_true');p.add_argument('--folder-context-size',type=int,default=0);p.add_argument('--profile-seconds',type=int,default=0);a=p.parse_args()
     repo=Path(__file__).resolve().parents[1];root=Path(tempfile.mkdtemp(prefix='task4-'+a.label+'-',dir=repo/'.test-data'))
     os.environ.update(SOUNDBOT_USER_DATA_DIR=str(root),SOUNDBOT_DATA_DIR=str(root),SOUNDBOT_MODELS_PATH=str(a.models.resolve()),PYTHONDONTWRITEBYTECODE='1',ENABLE_MODEL_PRELOAD='false')
     sys.path.insert(0,str(a.source.resolve()/'backend'))
@@ -51,10 +51,19 @@ def main():
     import main
     from unittest import mock
     embedder=CLIPEmbedder();service=get_audio_service();db=DatabaseManager(str(root/'db'/'soundmind.db'))
-    paths=json.loads(a.samples.read_text(encoding='utf-8'));ids=[]
+    paths=json.loads(a.samples.read_text(encoding='utf-8-sig'));ids=[]
     assert 0 < len(paths) <= 50, 'Sample limit is 50 files'
     for path in paths:
      meta=None if a.missing_metadata else service.probe(path);ids.append(db.upsert_file(AudioFileRecord(path=path,filename=Path(path).name,file_size=Path(path).stat().st_size,source_fingerprint=service.fingerprint(path).source_key,duration=meta.duration if meta else 0,sample_rate=meta.sample_rate if meta else 0,channels=meta.channels if meta else 0)))
+    context_start=time.perf_counter()
+    if a.folder_context_size:
+     # A per-job snapshot, matching the production 18k unmapped roots. Build
+     # outside steady indexing timing; report preparation separately.
+     mappings=[dict(folder_path=str(root/'imports'/str(i)),user_folder_id=None) for i in range(a.folder_context_size)]
+     fake_db=types.SimpleNamespace(get_user_folders=lambda _:[],get_imported_folder_mappings=lambda _:mappings)
+     with mock.patch.object(main,'get_db_manager',return_value=fake_db):snapshot=main._load_logical_folder_context('default')
+     main._load_logical_folder_context=lambda _:snapshot
+    context_seconds=time.perf_counter()-context_start
     # Warm kernels once; excludes model loading and first-call initialization.
     embedder._process_audio_segment(np.zeros(48000,dtype=np.float32))
     if a.warm_batches:
@@ -134,12 +143,26 @@ def main():
        result=subprocess.run(['nvidia-smi','--query-gpu=utilization.gpu,memory.used','--format=csv,noheader,nounits'],capture_output=True,text=True,creationflags=0x08000000)
        util.append([float(x) for x in result.stdout.strip().split(',')])
       except Exception:pass
-    thread=threading.Thread(target=monitor);thread.start();cpu0=sum(process.cpu_times()[:2]);start=time.perf_counter();torch.cuda.reset_peak_memory_stats()
-    job=db.create_job('default','index_task4_benchmark')
+    spy=None;spy_log=None
+    if a.profile_seconds:
+     spy_log=(repo/'.test-data'/f'{a.label}-pyspy.log').open('w',encoding='utf-8')
+     spy=subprocess.Popen(['uvx','py-spy','record','--pid',str(os.getpid()),'--gil','--nonblocking','--rate','100','--duration',str(a.profile_seconds),'--format','raw','--output',str(repo/'.test-data'/f'{a.label}-gil.raw')],stdout=spy_log,stderr=subprocess.STDOUT,creationflags=0x08000000)
+     time.sleep(1)
+    thread=threading.Thread(target=monitor);thread.start();cpu0=sum(process.cpu_times()[:2]);start=time.perf_counter();torch.cuda.reset_peak_memory_stats();repeats=0
     try:
-     with mock.patch.object(main,'get_db_manager',return_value=db):asyncio.run(main._repair_index_task_locked(job,'default',['waveform','audio_vector','text_vector'],'resume'))
+     while True:
+      job=db.create_job('default','index_task4_benchmark')
+      with mock.patch.object(main,'get_db_manager',return_value=db):asyncio.run(main._repair_index_task_locked(job,'default',['waveform','audio_vector','text_vector'],'resume'))
+      repeats+=1
+      assert db.get_job(job)['state']=='completed',db.get_job(job)
+      if not a.profile_seconds or time.perf_counter()-start>=a.profile_seconds:break
+      with db.get_cursor() as cursor:
+       cursor.execute("UPDATE file_artifacts SET state='pending'")
+       if a.missing_metadata:cursor.execute('UPDATE files SET duration=0,sample_rate=0,channels=0')
      elapsed=time.perf_counter()-start;cpu=sum(process.cpu_times()[:2])-cpu0
-    finally:stop.set();thread.join()
+    finally:
+     stop.set();thread.join()
+     if spy is not None:spy.wait(timeout=30);spy_log.close()
     jobdata=db.get_job(job);assert jobdata['state']=='completed',jobdata
     with db.get_cursor() as c: rows=c.execute('SELECT file_uuid,peaks_json FROM files').fetchall()
     indexer=get_indexer('default'); vectors=indexer.collection.get(ids=ids,include=['embeddings','metadatas'])
@@ -148,6 +171,8 @@ def main():
     byid=dict(zip(vectors['ids'],vectors['embeddings'].tolist()));peaks=dict(rows)
     results=[{'path':path,'size':Path(path).stat().st_size,'peaks':json.loads(peaks[fid]),'vector':byid[fid],'audio_metadata':metadata_byid[fid],'text_vector':text_byid[fid][0],'text_metadata':text_byid[fid][1],'stream_metadata':dbmeta[fid]} for path,fid in zip(paths,ids)]
     report={'worker_profile':[pool.stats for pool in pools if hasattr(pool,'stats')],'warm_batches':a.warm_batches,'audio_batch_sizes':audio_batches,'text_batch_sizes':text_batches,'timeline':timeline,'label':a.label,'source':str(a.source),'fixture':str(root),'seconds':elapsed,'files_per_minute':len(paths)*60/elapsed,'MB_per_second':sum(Path(p).stat().st_size for p in paths)/1e6/elapsed,'cpu_cores_mean':(cpu+sum(worker_cpu.values()))/elapsed,'parent_cpu_cores_mean':cpu/elapsed,'worker_peak_rss':worker_rss,'peak_process_tree_rss_bytes':max(rss or [process.memory_info().rss]),'cuda_peak_allocated':torch.cuda.max_memory_allocated(),'cuda_peak_reserved':torch.cuda.max_memory_reserved(),'gpu_global_util_mean':statistics.mean(x[0] for x in util) if util else None,'gpu_global_memory_peak_mib':max((x[1] for x in util),default=0),'profile_seconds':dict(metrics),'per_file_seconds':dict(per_file),'calls':dict(calls),'fingerprint':embedder.fingerprint,'job':jobdata,'results':results}
+    report.update(folder_context_size=a.folder_context_size,context_prepare_seconds=context_seconds,repeats=repeats,worker_cpu_seconds=worker_cpu)
+    report['files_per_minute']*=repeats;report['MB_per_second']*=repeats
     output=repo/'.test-data'/('task4-'+a.label+'.json');output.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps({k:v for k,v in report.items() if k not in ('results','timeline','per_file_seconds')},ensure_ascii=False),flush=True)
     main._executor.shutdown(wait=True);main._model_executor.shutdown(wait=True);db._get_connection().close()
