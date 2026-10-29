@@ -6,6 +6,7 @@ import tempfile
 import multiprocessing
 import logging
 import re
+import shutil
 import stat
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -18,6 +19,8 @@ from config import WAVEFORM_PEAK_COUNT
 _worker_cancel = None
 logger = logging.getLogger(__name__)
 _SPOOL_NAME = re.compile(r'index-audio-[a-z0-9_]{8}\.f32\Z')
+SPOOL_MIN_FREE_BYTES = 2 * 1024**3
+SPOOL_SPACE_CHECK_BYTES = 64 * 1024**2
 
 
 def default_parallelism():
@@ -185,6 +188,19 @@ def prepare_index_audio(service, path, sample_rate, *, waveform=True, cancel=Non
                     raise ValueError('audio stream has no sample rate')
                 wave_resampler = _av.AudioResampler(format='fltp', layout='mono', rate=native_rate) if waveform else None
                 clap_resampler = _av.AudioResampler(format='fltp', layout='mono', rate=sample_rate)
+                next_space_check = 0
+
+                def check_spool_space():
+                    # Long recordings are bounded by the disk, not a fixed
+                    # per-file budget; keep a reserve so the volume never fills.
+                    nonlocal next_space_check
+                    if spool_bytes < next_space_check:
+                        return
+                    next_space_check = spool_bytes + SPOOL_SPACE_CHECK_BYTES
+                    if shutil.disk_usage(root).free < SPOOL_MIN_FREE_BYTES:
+                        from core.audio_service import AudioServiceError
+                        raise AudioServiceError('index_spool_disk_full',
+                                                f'Not enough free disk space for the indexing spool in {root}')
 
                 def write(resampler, frame, output):
                     nonlocal spool_bytes
@@ -198,6 +214,7 @@ def prepare_index_audio(service, path, sample_rate, *, waveform=True, cancel=Non
                         if max_spool_bytes is not None and spool_bytes > max_spool_bytes:
                             from core.audio_service import AudioServiceError
                             raise AudioServiceError('index_spool_limit', 'Decoded audio exceeds the indexing spool budget')
+                        check_spool_space()
                         output.write(values.tobytes())
                         size += values.size
                     return size

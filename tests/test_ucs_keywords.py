@@ -29,6 +29,39 @@ class UCSKeywordTests(unittest.TestCase):
         self.assertIn('航空器', mapping)
         self.assertGreater(len(mapping), 100)
 
+    def test_repeated_categories_merge_synonyms_in_first_seen_order(self) -> None:
+        rows = [
+            {'Category_zh': '水', 'Synonyms - Comma Separated': 'rain, river, drip'},
+            {'Category_zh': '水', 'Synonyms - Comma Separated': 'drip, ocean, rain, wave'},
+        ]
+        with mock.patch.object(ucs_keywords, '_read_xlsx_rows', return_value=rows), \
+                mock.patch.object(ucs_keywords.os.path, 'exists', return_value=True):
+            mapping = ucs_keywords.load_ucs_keywords('fake.xlsx')
+
+        self.assertEqual(mapping['水'], ['rain', 'river', 'drip', 'ocean', 'wave'])
+
+    def test_committed_xlsx_mapping_does_not_depend_on_hash_seed(self) -> None:
+        import json
+        import os
+        import subprocess
+
+        script = (
+            'import json, sys; sys.path.insert(0, sys.argv[1]); '
+            'from core import ucs_keywords; '
+            'print(json.dumps(ucs_keywords.load_ucs_keywords(sys.argv[2]), ensure_ascii=False))'
+        )
+        outputs = set()
+        for seed in ('1', '2', '3'):
+            result = subprocess.run(
+                [sys.executable, '-c', script, str(BACKEND_DIR),
+                 str(REPO_ROOT / 'UCS+音效分类中英文对照表.xlsx')],
+                capture_output=True, text=True, encoding='utf-8', check=True,
+                env={**os.environ, 'PYTHONHASHSEED': seed},
+            )
+            outputs.add(result.stdout)
+
+        self.assertEqual(len(outputs), 1)
+
     def test_cached_matching_keeps_exact_labels_keyword_order_and_phrase_boundaries(self):
         import main
         mapping = {

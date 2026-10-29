@@ -11,8 +11,7 @@ from core.index_audio import prepare_index_audio, check_cancel, IndexWorkCancell
 from core.index_features import FeatureSpec, window_features
 import numpy as np
 
-_cancel = _features = _spec = None
-_spool_limit = 0
+_cancel = _features = _spec = _spool_limit = None
 
 
 def _timed_features(samples):
@@ -110,7 +109,7 @@ class FeaturePool:
     Only the initializer receives arrays describing the feature extractor, not
     the model or tokenizer. A job's workers are drained before claims restore.
     """
-    def __init__(self, workers, spec, *, spool_limit=2 * 1024**3):
+    def __init__(self, workers, spec, *, spool_limit=None):
         context = multiprocessing.get_context('spawn')
         self.cancel = context.Event()
         self.features = context.Queue(maxsize=32)

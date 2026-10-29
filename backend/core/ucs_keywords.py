@@ -229,11 +229,10 @@ def load_ucs_keywords(excel_path: Optional[str] = None) -> Dict[str, List[str]]:
                 if not chinese or chinese == 'nan':
                     continue
                     
-                # 如果中文关键词已存在，合并同义词列表
+                # 如果中文关键词已存在，按出现顺序合并去重（set 的顺序随
+                # hash seed 变化，会让同一文件的索引文本在每次启动时不同）
                 if chinese in keywords_map:
-                    existing = set(keywords_map[chinese])
-                    existing.update(en_keywords)
-                    keywords_map[chinese] = list(existing)
+                    keywords_map[chinese] = list(dict.fromkeys([*keywords_map[chinese], *en_keywords]))
                 else:
                     keywords_map[chinese] = en_keywords
         

@@ -76,6 +76,22 @@ class FeatureTests(unittest.TestCase):
             prepare_index_audio(service,path,48000,max_spool_bytes=16)
         self.assertEqual(list(service.waveform_work_dir.glob('index-audio-*.f32')),[])
 
+    def test_spool_stops_before_filling_the_disk_and_cleans_owned_file(self):
+        from core import index_audio
+        service=AudioService(self.root/'cache');path=make_wave(self.root)
+        low=types.SimpleNamespace(total=100*1024**3,used=0,free=index_audio.SPOOL_MIN_FREE_BYTES-1)
+        with mock.patch.object(index_audio.shutil,'disk_usage',return_value=low):
+            with self.assertRaisesRegex(Exception,'free disk space'):
+                prepare_index_audio(service,path,48000)
+        self.assertEqual(list(service.waveform_work_dir.glob('index-audio-*.f32')),[])
+
+    def test_long_recordings_are_not_capped_by_a_fixed_spool_budget(self):
+        import inspect
+        self.assertIsNone(inspect.signature(FeaturePool).parameters['spool_limit'].default)
+        service=AudioService(self.root/'cache');path=make_wave(self.root)
+        prepared=prepare_index_audio(service,path,48000)
+        prepared.close()
+
     def test_peak_reduction_matches_old_bins_at_read_and_empty_bin_boundaries(self):
         from core.index_audio import file_peaks
         for size in (0, 1, 2, 1999, 2000, 2001, 262143, 262144, 262145, 524289):
