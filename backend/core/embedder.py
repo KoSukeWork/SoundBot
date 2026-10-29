@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
@@ -283,22 +285,27 @@ class CLIPEmbedder:
         try:
             from core.audio_service import get_audio_service
 
-            decoded = get_audio_service().decode(
-                audio_path,
-                target_sample_rate=self.sample_rate,
-                mono=True,
-            )
-            audio = decoded.samples
-            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-            if audio.size == 0:
-                raise ValueError("音频为空")
-            if audio.size <= self.max_samples:
-                return self._process_audio_segment(audio)
-            return self._process_long_audio(audio)
+            from core.index_audio import prepare_index_audio
+            from core.audio_service import AudioServiceError
+            try:
+                prepared = prepare_index_audio(get_audio_service(), audio_path, self.sample_rate, waveform=False)
+            except Exception as exc:
+                if isinstance(exc, AudioServiceError):
+                    raise
+                raise AudioServiceError('audio_decode_failed', f'Unable to decode audio: {audio_path}') from exc
+            try:
+                return self.prepared_audio_to_embedding(prepared)
+            finally:
+                prepared.close()
         except Exception as exc:
             raise RuntimeError(f"[Embedder] 处理 {audio_path} 失败: {exc}") from exc
 
-    def _processor_inputs(self, audio: np.ndarray):
+    def _processor_inputs(self, audio: np.ndarray, *, cpu=False):
+        extractor = getattr(self.processor, 'feature_extractor', None)
+        if (cpu and type(extractor).__name__ == 'ClapFeatureExtractor'
+                and os.getenv('SOUNDBOT_FAST_MEL', '1') != '0'):
+            from core.clap_features import window_inputs
+            return window_inputs(audio, extractor, self.max_samples)
         # Segments are never longer than max_samples, so rand_trunc cannot pick
         # a random crop. Padding is deterministic for the final short segment.
         kwargs = {
@@ -309,9 +316,71 @@ class CLIPEmbedder:
             "return_tensors": "pt",
         }
         try:
-            return self.processor(audio=[audio], **kwargs).to(self.device)
+            inputs = self.processor(audio=[audio], **kwargs)
         except TypeError:
-            return self.processor(audios=[audio], **kwargs).to(self.device)
+            inputs = self.processor(audios=[audio], **kwargs)
+        return inputs if cpu else inputs.to(self.device)
+
+    def _forward_audio_batch(self, inputs, cancel=None):
+        from core.index_audio import check_cancel
+        check_cancel(cancel)
+        try:
+            with self._inference_lock, torch.inference_mode():
+                check_cancel(cancel)
+                device_inputs = {key: value.to(self.device) for key, value in inputs.items()}
+                outputs = self.model.get_audio_features(**device_inputs)
+                tensor = outputs.pooler_output if hasattr(outputs, 'pooler_output') else outputs
+                return tensor.detach().cpu().numpy()
+        except torch.OutOfMemoryError:
+            # Smaller cards can retain the old single-window footprint. Do not
+            # change precision, skip windows, or alter the engine identity.
+            device_inputs = outputs = tensor = None
+            size = next(iter(inputs.values())).shape[0]
+            if size <= 1:
+                raise
+            if str(self.device).startswith('cuda'):
+                torch.cuda.empty_cache()
+        midpoint = size // 2
+        return np.concatenate([self._forward_audio_batch({k:v[:midpoint] for k,v in inputs.items()}, cancel),
+                               self._forward_audio_batch({k:v[midpoint:] for k,v in inputs.items()}, cancel)])
+
+    def prepared_audio_to_embedding(self, prepared, cancel=None):
+        """Overlap bounded CPU feature batches with serialized FP32 forwards.
+
+        Uses equivalent CPU feature extraction, exact window boundaries and per-
+        window normalization. No GPU mel, mixed precision or fingerprint change.
+        """
+        from core.index_audio import check_cancel, default_parallelism
+        batch_size = max(1, min(16, int(os.getenv('SOUNDBOT_CLAP_BATCH_SIZE', '8'))))
+        workers = max(1, min(4, int(os.getenv('SOUNDBOT_MEL_WORKERS', str(default_parallelism())))))
+        windows = iter(prepared.windows(self.max_samples, cancel))
+        # A running sum keeps memory independent of recording duration. Float64
+        # accumulation changes only reduction rounding, checked by cosine tests.
+        total, count = None, 0
+        try:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='clap-mel') as pool:
+                def enqueue():
+                    check_cancel(cancel)
+                    return [pool.submit(self._processor_inputs, audio, cpu=True)
+                            for audio in islice(windows, batch_size)]
+                pending = enqueue()
+                while pending:
+                    check_cancel(cancel)
+                    features = [future.result() for future in pending]
+                    inputs = {key: torch.cat([item[key] for item in features], dim=0)
+                              for key in features[0]}
+                    pending = enqueue()  # At most two CPU batches; only one GPU batch.
+                    outputs = self._forward_audio_batch(inputs, cancel)
+                    for output in outputs:
+                        vector = normalize_embedding(output)
+                        total = vector.astype(np.float64) if total is None else total + vector
+                        count += 1
+        finally:
+            windows.close()
+        check_cancel(cancel)
+        if not count:
+            raise ValueError('音频为空')
+        return normalize_embedding(total / count)
 
     @staticmethod
     def _output_vector(outputs: Any) -> np.ndarray:

@@ -79,6 +79,12 @@ class AudioServiceError(RuntimeError):
             'details': self.details,
         }
 
+    def __reduce__(self):
+        # Process-pool failures must retain structured error metadata without
+        # breaking the result channel (RuntimeError.args contains only message).
+        return (type(self), (self.code, self.message),
+                {'retryable': self.retryable, 'details': self.details})
+
 
 @dataclass(frozen=True)
 class FileFingerprint:
@@ -270,12 +276,12 @@ class AudioService:
                 details={'path': str(source), 'decoder': 'pyav'},
             ) from exc
 
-    def waveform(self, path: os.PathLike[str] | str) -> WaveformResult:
+    def waveform(self, path: os.PathLike[str] | str, *, cancel=None) -> WaveformResult:
         """Return exactly 2,000 deterministic normalised mono peaks."""
         source = self._validate_source(path)
         self._require_pyav()
         try:
-            return self._waveform_with_pyav_streaming(source)
+            return self._waveform_with_pyav_streaming(source, cancel=cancel)
         except Exception as exc:
             raise AudioServiceError(
                 'waveform_decode_failed',
@@ -283,7 +289,7 @@ class AudioService:
                 details={'path': str(source), 'decoder': 'pyav'},
             ) from exc
 
-    def _waveform_with_pyav_streaming(self, source: Path) -> WaveformResult:
+    def _waveform_with_pyav_streaming(self, source: Path, *, cancel=None) -> WaveformResult:
         """Decode mono frames through a bounded temporary file.
 
         This keeps waveform memory usage essentially constant for long files
@@ -323,19 +329,21 @@ class AudioService:
                         values = np.nan_to_num(
                             values, copy=False, nan=0.0, posinf=1.0, neginf=-1.0
                         )
-                        values.tofile(sink)
+                        sink.write(values.tobytes())
                         frame_count += int(values.size)
 
                 for frame in container.decode(stream):
+                    if cancel is not None and cancel.is_set():
+                        from core.index_audio import IndexWorkCancelled
+                        raise IndexWorkCancelled()
                     write_frames(resampler.resample(frame))
                 write_frames(resampler.resample(None))
                 sink.flush()
 
             if frame_count:
-                mapped = np.memmap(
-                    temp_path, dtype=np.float32, mode="r", shape=(frame_count,)
-                )
-                peaks = self._fixed_peaks_bounded(mapped, WAVEFORM_PEAK_COUNT)
+                from core.index_audio import file_peaks
+                with temp_path.open('rb') as stream:
+                    peaks = file_peaks(stream, frame_count, cancel)
             else:
                 peaks = [0.0] * WAVEFORM_PEAK_COUNT
             return WaveformResult(
@@ -606,7 +614,7 @@ class AudioService:
         return np.clip(peaks, 0.0, 1.0).astype(float).tolist()
 
     @staticmethod
-    def _fixed_peaks_bounded(samples: np.ndarray, count: int) -> list[float]:
+    def _fixed_peaks_bounded(samples: np.ndarray, count: int, *, cancel=None) -> list[float]:
         """Compute fixed peaks without materialising an absolute-value copy."""
         size = int(samples.size)
         if size == 0:
@@ -614,6 +622,9 @@ class AudioService:
         boundaries = np.linspace(0, size, count + 1, dtype=np.int64)
         peaks = np.zeros(count, dtype=np.float32)
         for index in range(count):
+            if cancel is not None and cancel.is_set():
+                from core.index_audio import IndexWorkCancelled
+                raise IndexWorkCancelled()
             start, end = int(boundaries[index]), int(boundaries[index + 1])
             if end <= start:
                 value = float(samples[min(start, size - 1)])

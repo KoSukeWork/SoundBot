@@ -35,6 +35,9 @@ class MetadataRecoveryTests(unittest.IsolatedAsyncioTestCase):
         scratch = ROOT / '.test-data'
         scratch.mkdir(exist_ok=True)
         self.root = Path(tempfile.mkdtemp(prefix='metadata-', dir=scratch))
+        self.storage_env = mock.patch.dict(os.environ, {'SOUNDBOT_DATA_DIR': str(self.root)})
+        self.storage_env.start()
+        self.addCleanup(self.storage_env.stop)
         self.db = DatabaseManager(str(self.root / 'db' / 'soundmind.db'))
         self.service = get_audio_service()
         self.ids = []
@@ -143,6 +146,20 @@ class MetadataRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.resume()
         self.assertEqual(self.embedder.audio_to_embedding.call_count,3)
         self.assertEqual(self.text.collection.count(),3)
+
+    async def test_one_bad_chroma_row_does_not_fail_other_rows(self):
+        original = self.audio.write_prepared_audio
+        bad = self.ids[1]
+        def write(rows):
+            if any(row['file_id'] == bad for row in rows):
+                raise ValueError('one invalid Chroma row')
+            return original(rows)
+        with mock.patch.object(self.audio,'write_prepared_audio',side_effect=write):
+            _,(failures,cancelled)=await self.resume()
+        self.assertFalse(cancelled)
+        self.assertEqual(failures,{'audio_vector':1,'text_vector':0,'waveform':0})
+        self.assertEqual(self.audio.collection.count(),2)
+        self.assertEqual(self.db.get_artifact('default',bad,'audio_vector')['state'],'failed')
 
     async def test_failed_probe_is_attempted_once_per_file_and_pass(self):
         original = self.fake_service.probe

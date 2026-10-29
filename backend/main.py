@@ -20,6 +20,9 @@
 # The frozen executable and source desktop share the same offline storage CLI.
 # Dispatch before importing models, logging or creating database singletons.
 import sys
+if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
 if __name__ == '__main__' and '--storage-tool' in sys.argv:
     from core.data_migration import cli as storage_cli
     raise SystemExit(storage_cli(sys.argv[sys.argv.index('--storage-tool') + 1:]))
@@ -282,6 +285,11 @@ async def _application_lifespan(app: FastAPI):
     logger.info(f"临时文件目录: {temp_dir}")
 
     logger.info("临时文件由用户自行管理，不执行自动清理")
+
+    # Internal indexing spools are separate from user-managed clips.
+    from core.audio_service import get_audio_service
+    from core.index_audio import cleanup_stale_spools
+    await _run_audio_work(cleanup_stale_spools, get_audio_service().waveform_work_dir)
 
     # 启动模型预加载（后台异步）。完成事件会自动修复所有工程中
     # 因模型缺失而保持 pending/failed/stale 的双索引 artifact。

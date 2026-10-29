@@ -27,7 +27,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import chromadb
 import numpy as np
-from chromadb.config import Settings
 
 import config
 from core.database import canonicalize_path
@@ -204,10 +203,8 @@ def get_chroma_client(persist_directory: Optional[str] = None) -> chromadb.Persi
     key = os.path.normcase(str(path))
     with _clients_lock:
         if key not in _chroma_clients:
-            _chroma_clients[key] = chromadb.PersistentClient(
-                path=str(path),
-                settings=Settings(anonymized_telemetry=False, is_persistent=True),
-            )
+            from core.chroma_client import persistent_client
+            _chroma_clients[key] = persistent_client(path)
         return _chroma_clients[key]
 
 
@@ -333,10 +330,13 @@ class AudioIndexer:
         return str(explicit) if explicit else self._generate_file_id(file_path)
 
     def _generate_embedding_for_file(
-        self, file_id: str, file_path: str, audio_file: Any, embedder: Any
+        self, file_id: str, file_path: str, audio_file: Any, embedder: Any,
+        prepared_audio=None, cancel=None,
     ) -> Optional[Dict[str, Any]]:
         try:
-            embedding = normalize_embedding(embedder.audio_to_embedding(file_path))
+            embedding = normalize_embedding(
+                embedder.prepared_audio_to_embedding(prepared_audio, cancel)
+                if prepared_audio is not None else embedder.audio_to_embedding(file_path))
             metadata = _sanitize_metadata(
                 {
                     "file_path": file_path,
@@ -359,6 +359,9 @@ class AudioIndexer:
             )
             return {"file_id": file_id, "embedding": embedding.tolist(), "metadata": metadata}
         except Exception as exc:
+            from core.index_audio import IndexWorkCancelled
+            if isinstance(exc, IndexWorkCancelled):
+                raise
             logger.error("生成 embedding 失败 %s: %s", file_path, exc)
             return None
 
@@ -483,11 +486,15 @@ class AudioIndexer:
             self.write_prepared_audio([row])
             return True
         except Exception as exc:
+            from core.index_audio import IndexWorkCancelled
+            if isinstance(exc, IndexWorkCancelled):
+                raise
             logger.error("添加文件向量失败 %s: %s", file_path, exc)
             return False
 
     def prepare_audio(
-        self, file_path: str, metadata: Optional[Dict[str, Any]] = None
+        self, file_path: str, metadata: Optional[Dict[str, Any]] = None,
+        *, prepared_audio=None, cancel=None,
     ) -> Optional[Dict[str, Any]]:
         """Encode on the model worker; defer Chroma I/O until a bounded batch."""
         metadata = dict(metadata or {})
@@ -521,7 +528,8 @@ class AudioIndexer:
                 if audio_info is None:
                     return None
 
-            row = self._generate_embedding_for_file(file_id, file_path, audio_info, embedder)
+            row = self._generate_embedding_for_file(file_id, file_path, audio_info, embedder,
+                                                     prepared_audio, cancel)
             if row is None:
                 return None
             row["metadata"].update(_sanitize_metadata(metadata))

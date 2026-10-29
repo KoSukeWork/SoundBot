@@ -135,7 +135,7 @@ class VectorCoreTests(unittest.TestCase):
     def test_project_path_rejects_escape_before_creating_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.object(indexer_module.config, "get_user_data_dir", return_value=root):
+            with mock.patch.object(indexer_module.config, "get_data_dir", return_value=root):
                 resolved = safe_project_chroma_path("legacy-project_01")
                 self.assertEqual(resolved.parent, (root / "chroma_projects").resolve())
                 for invalid in (

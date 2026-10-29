@@ -111,7 +111,8 @@ class AudioServiceTests(unittest.TestCase):
         embedder.device = 'cpu'
         extractor = ClapFeatureExtractor()
         embedder.processor = lambda audio, **kwargs: extractor(audio, **kwargs)
-        embedder._process_audio_segment = embedder._processor_inputs
+        embedder.prepared_audio_to_embedding = lambda prepared: embedder._processor_inputs(
+            next(prepared.windows(embedder.max_samples)))
         with mock.patch('core.audio_service.get_audio_service', return_value=service):
             tagged_inputs = embedder.audio_to_embedding(str(tagged))
             clean_inputs = embedder.audio_to_embedding(str(self.source))
