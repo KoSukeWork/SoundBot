@@ -50,6 +50,7 @@ def check_environment():
         MODELS_DIR,
         CLAP_MODEL_PATH,
         get_db_path,
+        get_data_dir,
         get_temp_dir
     )
     
@@ -97,8 +98,7 @@ def check_environment():
     # 检查磁盘空间 (至少 1GB 可用)
     try:
         import shutil
-        user_data = get_user_data_dir()
-        stat = shutil.disk_usage(user_data)
+        stat = shutil.disk_usage(get_data_dir())
         free_gb = stat.free / (1024**3)
         if free_gb < 1:
             warnings.append({

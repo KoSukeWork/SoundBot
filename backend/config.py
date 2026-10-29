@@ -119,9 +119,15 @@ def find_models_dir() -> Path:
     return possible_paths[0] if possible_paths else exe_dir / 'models'
 
 
+def get_data_dir() -> Path:
+    """Database storage only; settings, secrets, logs and caches stay in userData."""
+    from core.storage_paths import resolve_data_dir
+    return resolve_data_dir(get_user_data_dir())
+
+
 def get_db_path() -> Path:
     """获取数据库存储路径（用户数据目录）"""
-    db_path = get_user_data_dir() / 'db'
+    db_path = get_data_dir() / 'db'
     db_path.mkdir(parents=True, exist_ok=True)
     return db_path
 
@@ -149,7 +155,7 @@ def get_chroma_db_path(project_id: str = "default") -> Path:
         or stem in reserved
     ):
         raise ValueError("工程 ID 包含非法字符")
-    root = (get_user_data_dir() / 'chroma_projects').resolve(strict=False)
+    root = (get_data_dir() / 'chroma_projects').resolve(strict=False)
     db_path = (root / value).resolve(strict=False)
     db_path.relative_to(root)
     db_path.mkdir(parents=True, exist_ok=True)

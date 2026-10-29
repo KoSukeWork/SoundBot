@@ -25,6 +25,7 @@ def main():
     # worker threads may keep Windows handles until the verification process exits.
     with tempfile.TemporaryDirectory(prefix="gpu-", dir=scratch, delete=False) as directory:
         os.environ["SOUNDBOT_USER_DATA_DIR"] = directory
+        os.environ["SOUNDBOT_DATA_DIR"] = directory
         os.environ["SOUNDBOT_MODELS_PATH"] = str(args.models.resolve())
         os.environ["SOUNDBOT_PORT"] = "8011"
         sys.path.insert(0, str(root / "backend"))

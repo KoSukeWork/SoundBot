@@ -164,6 +164,10 @@
                         <span data-i18n="lang.en">English</span><i data-lucide="check" class="w-4 h-4 check-icon hidden"></i>
                     </button>
                     <div class="border-t my-2" style="border-color: var(--border-color);"></div>
+                    <div class="px-3 py-2 text-xs font-medium opacity-50">数据目录</div>
+                    <div id="dataDirText" class="px-4 text-xs break-all opacity-80">加载中...</div>
+                    <button id="changeDataDirBtn" class="w-full px-4 py-2 text-sm text-left hover:bg-black/5 dark:hover:bg-white/5">更改数据目录…</button>
+                    <div id="dataDirStatus" class="px-4 text-xs opacity-70" role="status" aria-live="polite"></div>
                     <div class="px-3 py-2 text-xs font-medium uppercase tracking-wider opacity-50" data-i18n="settings.temp.dir">临时文件目录</div>
                     <button id="tempDirBtn" class="w-full px-4 py-2 text-sm text-left hover:bg-black/5 dark:hover:bg-white/5 flex items-center gap-2">
                         <i data-lucide="folder" class="w-4 h-4"></i>
@@ -3268,7 +3272,41 @@
             // 打开设置时加载当前临时文件目录
             if (!dropdown.classList.contains('hidden')) {
                 loadTempDir();
+                loadDataDir();
             }
+        }
+
+        async function loadDataDir() {
+            const text = document.getElementById('dataDirText');
+            const button = document.getElementById('changeDataDirBtn');
+            if (!window.electronAPI?.storage) {
+                text.textContent = '请在桌面应用中更改'; button.disabled = true; return;
+            }
+            try {
+                const info = await window.electronAPI.storage.getDirectory();
+                text.textContent = info.data_dir;
+                button.disabled = info.changing || info.overridden;
+                document.getElementById('dataDirStatus').textContent = info.overridden ? '由 SOUNDBOT_DATA_DIR 环境变量指定' : '';
+            } catch (error) { text.textContent = error.message; }
+        }
+
+        async function changeDataDir() {
+            const button = document.getElementById('changeDataDirBtn');
+            const status = document.getElementById('dataDirStatus');
+            button.disabled = true;
+            const labels = { hashing_source: '正在校验原数据…', copying: '正在复制数据…',
+                verifying: '正在校验副本…', validating_existing: '正在检查目标数据…', complete: '迁移完成，正在启动后端…' };
+            const remove = window.electronAPI.storage.onProgress(value => {
+                if (labels[value.phase]) status.textContent = labels[value.phase];
+            });
+            try {
+                status.textContent = '请选择目标目录并确认；索引任务需先暂停。';
+                const result = await window.electronAPI.storage.changeDirectory();
+                if (result.canceled) status.textContent = '';
+            } catch (error) {
+                status.textContent = error.message;
+                showNotification(error.message, 'error');
+            } finally { remove(); button.disabled = false; }
         }
         
         // 加载临时文件目录
@@ -4660,6 +4698,7 @@
             });
             
             document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+            document.getElementById('changeDataDirBtn').addEventListener('click', changeDataDir);
             
             // 临时文件目录按钮
             document.getElementById('tempDirBtn').addEventListener('click', (e) => {

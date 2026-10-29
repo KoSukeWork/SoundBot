@@ -17,6 +17,13 @@
 
 """FastAPI 后端服务，用于音效管理器的 AI 语义搜索功能。"""
 
+# The frozen executable and source desktop share the same offline storage CLI.
+# Dispatch before importing models, logging or creating database singletons.
+import sys
+if __name__ == '__main__' and '--storage-tool' in sys.argv:
+    from core.data_migration import cli as storage_cli
+    raise SystemExit(storage_cli(sys.argv[sys.argv.index('--storage-tool') + 1:]))
+
 import os
 import re
 import time
@@ -60,7 +67,7 @@ def validate_path(path: str, allow_absolute: bool = True) -> bool:
     
     return True
 
-from fastapi import FastAPI, HTTPException, Query, Path as PathParam, BackgroundTasks, WebSocket, WebSocketDisconnect, Body
+from fastapi import FastAPI, HTTPException, Query, Path as PathParam, BackgroundTasks, WebSocket, WebSocketDisconnect, Body, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, StreamingResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -98,20 +105,25 @@ _project_index_locks: Dict[str, asyncio.Lock] = {}
 _projects_deleting: set[str] = set()
 _automatic_index_tasks: Dict[str, Dict[str, Any]] = {}
 _shutting_down = False
+_storage_shutdown = False
+_startup_paused = os.environ.get('SOUNDBOT_START_PAUSED') == '1'
+_active_requests = 0
+_worker_futures = set()
+_uvicorn_server = None
 
 
 async def _run_audio_work(function, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _executor, functools.partial(function, *args, **kwargs)
-    )
+    future = _executor.submit(functools.partial(function, *args, **kwargs))
+    _worker_futures.add(future)
+    future.add_done_callback(_worker_futures.discard)
+    return await asyncio.wrap_future(future)
 
 
 async def _run_model_work(function, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _model_executor, functools.partial(function, *args, **kwargs)
-    )
+    future = _model_executor.submit(functools.partial(function, *args, **kwargs))
+    _worker_futures.add(future)
+    future.add_done_callback(_worker_futures.discard)
+    return await asyncio.wrap_future(future)
 
 
 def _get_project_index_lock(project_id: str) -> asyncio.Lock:
@@ -239,7 +251,7 @@ def cleanup_old_clips(max_keep=100):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def _application_lifespan(app: FastAPI):
     """应用生命周期管理"""
     global _shutting_down
     _shutting_down = False
@@ -321,6 +333,20 @@ async def lifespan(app: FastAPI):
     logger.info("全局单例状态已清理")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from core.storage_paths import storage_locks
+    from core.data_migration import PENDING, MOVED
+    user, data = config.get_user_data_dir(), config.get_data_dir()
+    with storage_locks(user, data):
+        if (user / PENDING).exists():
+            raise RuntimeError('Interrupted data migration; run move_data_dir.py --recover offline')
+        if (data / MOVED).exists():
+            raise RuntimeError('This data directory was migrated; use its new location')
+        async with _application_lifespan(app):
+            yield
+
+
 # 创建 FastAPI 应用
 app = FastAPI(
     title="SoundBot API",
@@ -328,6 +354,68 @@ app = FastAPI(
     version=config.APP_VERSION,
     lifespan=lifespan
 )
+
+
+@app.middleware('http')
+async def storage_request_gate(request: Request, call_next):
+    global _active_requests
+    control = request.url.path.startswith('/api/v1/system/') or request.url.path in ('/api/v1/health', '/api/health')
+    if not control and (_storage_shutdown or _startup_paused):
+        return JSONResponse(status_code=503, content={'detail': 'Data directory switch in progress'})
+    if not control:
+        _active_requests += 1
+    try:
+        return await call_next(request)
+    finally:
+        if not control:
+            _active_requests -= 1
+
+
+def _storage_activity():
+    with get_db_manager().get_cursor() as cursor:
+        jobs = cursor.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('pending','running')").fetchone()[0]
+    tasks = sum(not entry['task'].done() for entry in list(_automatic_index_tasks.values()))
+    return {'jobs': jobs, 'tasks': tasks, 'requests': _active_requests, 'workers': len(_worker_futures)}
+
+
+def _check_control_token(request):
+    import secrets
+    expected = os.environ.get('SOUNDBOT_CONTROL_TOKEN', '')
+    if not expected or not secrets.compare_digest(request.headers.get('X-SoundBot-Control', ''), expected):
+        raise HTTPException(status_code=403, detail='Desktop control token required')
+
+
+@app.get('/api/v1/system/storage-status')
+async def storage_status():
+    activity = _storage_activity()
+    return dict(activity, busy=any(activity.values()), data_dir=str(config.get_data_dir()))
+
+
+@app.post('/api/v1/system/shutdown')
+async def storage_shutdown(request: Request, background_tasks: BackgroundTasks):
+    global _storage_shutdown, _shutting_down
+    _check_control_token(request)
+    activity = _storage_activity()
+    if any(activity.values()):
+        raise HTTPException(status_code=409, detail='请先暂停所有工程的导入/索引任务，等待操作结束后再更改数据目录。')
+    if _uvicorn_server is None:
+        raise HTTPException(status_code=503, detail='This backend does not support desktop shutdown')
+    # No await between idle check and gate: no new request or model-ready job
+    # can enter on this event loop after the check.
+    _storage_shutdown = _shutting_down = True
+    background_tasks.add_task(setattr, _uvicorn_server, 'should_exit', True)
+    return {'accepted': True}
+
+
+@app.post('/api/v1/system/resume')
+async def storage_resume(request: Request):
+    global _startup_paused
+    _check_control_token(request)
+    _startup_paused = False
+    _schedule_waveform_reconcile()
+    if is_embedder_available():
+        _schedule_model_ready_reconcile()
+    return {'resumed': True}
 
 
 @app.exception_handler(SoundBotAPIError)
@@ -2387,7 +2475,7 @@ def _schedule_project_reconcile(
     reason: str,
 ) -> Optional[str]:
     """Create one durable automatic reconcile job per project at a time."""
-    if _shutting_down or project_id in _projects_deleting:
+    if _shutting_down or _startup_paused or project_id in _projects_deleting:
         return None
     db_manager = get_db_manager()
     if not is_safe_project_id(project_id) or not db_manager.get_project(project_id):
@@ -4280,9 +4368,5 @@ if __name__ == "__main__":
     # 必须传 app 对象而非字符串 "main:app"
     # 字符串形式会让 uvicorn 尝试 importlib.import_module("main")，
     # 在 PyInstaller 冻结环境中会失败：Could not import module "main"
-    uvicorn.run(
-        app,
-        host=config.HOST,
-        port=_port,
-        log_level="info"
-    )
+    _uvicorn_server = uvicorn.Server(uvicorn.Config(app, host=config.HOST, port=_port, log_level='info'))
+    _uvicorn_server.run()

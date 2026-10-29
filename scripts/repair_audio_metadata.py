@@ -110,12 +110,14 @@ SELECT_ROWS = '''SELECT f.id,f.file_uuid,f.path,f.project_id,f.duration,f.sample
 
 
 def run(data, *, apply=False, batch_size=128):
-    data = Path(data).resolve()
+    from core.storage_paths import resolve_data_dir
+    user_data = Path(data).resolve()
+    data = resolve_data_dir(user_data)
     database = data / 'db' / 'soundmind.db'
     if not database.is_file():
         raise RuntimeError(f'Database does not exist: {database}')
     require_offline()
-    os.environ['SOUNDBOT_USER_DATA_DIR'] = str(data)
+    os.environ['SOUNDBOT_USER_DATA_DIR'] = str(user_data)
     # Deliberately avoid DatabaseManager: it recovers jobs/artifacts on startup.
     conn = sqlite3.connect(database.as_uri() + ('?mode=rw' if apply else '?mode=ro'), uri=True)
     conn.row_factory = sqlite3.Row

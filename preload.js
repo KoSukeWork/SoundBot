@@ -74,6 +74,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
 
   // 文件导入（专门为导入按钮设计）
+  storage: {
+    getDirectory: () => ipcRenderer.invoke('storage-directory', 'get'),
+    changeDirectory: () => ipcRenderer.invoke('storage-directory', 'change'),
+    onProgress: (callback) => {
+      const listener = (_event, value) => callback(value);
+      ipcRenderer.on('storage-progress', listener);
+      return () => ipcRenderer.removeListener('storage-progress', listener);
+    }
+  },
+
+  // 文件导入（专门为导入按钮设计）
   fileImport: {
     // The main process owns the canonical capability manifest. Returning it
     // over IPC avoids duplicating the table or loading local modules here.

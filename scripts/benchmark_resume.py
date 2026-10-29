@@ -32,6 +32,7 @@ def main():
     # This script is deliberately restricted to scratch data below this repo.
     data.relative_to(Path(__file__).resolve().parents[1] / '.test-data')
     os.environ['SOUNDBOT_USER_DATA_DIR'] = str(data)
+    os.environ['SOUNDBOT_DATA_DIR'] = str(data)
     sys.path.insert(0, str(args.backend.resolve()))
     from core.database import DatabaseManager, canonicalize_path
     from core.audio_service import FileFingerprint, WaveformResult

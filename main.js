@@ -10,6 +10,8 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const net = require('net');
+const crypto = require('crypto');
+const { switchStorage } = require('./assets/main/storage-switch.cjs');
 const audioCapabilityManifest = require('./config/audio_capabilities.json');
 const supportedAudioExtensions = new Set(Object.keys(audioCapabilityManifest.formats || {}));
 const supportedAudioFilterExtensions = [...supportedAudioExtensions].map((value) => value.slice(1));
@@ -42,6 +44,8 @@ let rendererBridgeReady = false;
 let rendererPreloadFailure = null;
 const activeBackendRequests = new Map();
 let quitInProgress = false;
+let storageChanging = false;
+let backendControlToken = '';
 let pendingSplashState = {
   status: '正在启动服务…',
   progress: '初始化中',
@@ -548,7 +552,7 @@ function updateBackendEndpoint(port) {
 /**
  * 启动后端服务
  */
-async function startBackend() {
+async function startBackend({ paused = false } = {}) {
   migrateLegacyPlaintextSecrets();
   if (backendProcess) {
     console.log('[Backend] Backend service already running');
@@ -587,11 +591,14 @@ async function startBackend() {
   }
 
   // 设置环境变量
+  backendControlToken = crypto.randomBytes(32).toString('hex');
   const env = {
     ...process.env,
     SOUNDBOT_PORT: String(backendPort),
     SOUNDBOT_MODELS_PATH: modelStatus.path,
     SOUNDBOT_USER_DATA_DIR: getUserDataDir(),
+    SOUNDBOT_CONTROL_TOKEN: backendControlToken,
+    SOUNDBOT_START_PAUSED: paused ? '1' : '0',
     PYTHONUNBUFFERED: '1',
     PYTHONIOENCODING: 'utf-8'
   };
@@ -737,6 +744,7 @@ async function waitForBackendHealth(timeoutMs = 120000) {
 }
 
 async function ensureBackendStarted() {
+  if (storageChanging) return { success: false, error: '数据目录切换中，请等待完成' };
   if (backendProcess) {
     const result = await waitForBackendHealth();
     if (result.success) await hydrateBackendAISecrets();
@@ -1188,6 +1196,103 @@ async function stopBackend() {
 
 // ==================== 窗口管理 ====================
 
+function storageInfo() {
+  const user = getUserDataDir();
+  const file = path.join(user, 'user_config.json');
+  const settings = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) : {};
+  const selected = process.env.SOUNDBOT_DATA_DIR || settings.dataDir || user;
+  if (!path.isAbsolute(selected)) throw new Error('数据目录必须是绝对路径');
+  return { data_dir: path.resolve(selected), overridden: Boolean(process.env.SOUNDBOT_DATA_DIR), changing: storageChanging };
+}
+
+async function desktopControl(action) {
+  const response = await fetch(`${apiBaseUrl}/system/${action}`, {
+    method: 'POST', headers: { 'X-SoundBot-Control': backendControlToken },
+    signal: AbortSignal.timeout(10000)
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.message || payload.detail || '后端控制请求失败');
+  return payload;
+}
+
+async function stopBackendForStorage() {
+  const child = backendProcess;
+  if (!child || child.exitCode !== null) return;
+  // Register the exit listener before requesting shutdown to avoid an exit race.
+  let listener;
+  let timer;
+  const exited = new Promise((resolve, reject) => {
+    listener = resolve;
+    child.once('exit', listener);
+    timer = setTimeout(() => reject(new Error('后端仍在正常关闭，请等待退出后再试。未强制结束进程。')), 120000);
+  });
+  // Attach a handler immediately, even if the HTTP request is rejected first.
+  exited.catch(() => {});
+  try {
+    await desktopControl('shutdown');
+    await exited;
+  } finally {
+    clearTimeout(timer);
+    child.removeListener('exit', listener);
+  }
+}
+
+function runStorageTool(args) {
+  const sourcePython = !app.isPackaged && process.env.SOUNDBOT_PYTHON;
+  const executable = sourcePython ? path.resolve(sourcePython) : getBackendExecutable();
+  if (!executable) throw new Error('找不到离线迁移程序');
+  const prefix = sourcePython ? [path.join(__dirname, 'backend', 'main.py')] : [];
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, [...prefix, '--storage-tool', ...args, '--user-data-dir', getUserDataDir()], {
+      cwd: __dirname, windowsHide: true,
+      env: { ...process.env, SOUNDBOT_USER_DATA_DIR: getUserDataDir(), PYTHONDONTWRITEBYTECODE: '1', PYTHONIOENCODING: 'utf-8' },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let buffer = '', result, error = '', diagnostics = '';
+    child.stdout.on('data', chunk => {
+      buffer += chunk.toString();
+      const lines = buffer.split(/\r?\n/); buffer = lines.pop();
+      for (const line of lines) {
+        try {
+          const event = JSON.parse(line);
+          if (event.result) result = event.result;
+          if (event.error) error = event.error;
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('storage-progress', event);
+        } catch (_) { /* Diagnostics are not migration instructions. */ }
+      }
+    });
+    child.stderr.on('data', chunk => { diagnostics = (diagnostics + chunk.toString()).slice(-4000); });
+    child.on('error', reject);
+    child.on('exit', code => code === 0 && result ? resolve(result) : reject(new Error(error || diagnostics || `迁移程序退出 (${code})`)));
+  });
+}
+
+async function chooseDataDirectory(event) {
+  if (storageChanging) throw new Error('数据目录切换正在进行');
+  if (storageInfo().overridden) throw new Error('当前使用 SOUNDBOT_DATA_DIR 环境变量，请移除覆盖并重启后更改持久设置。');
+  const choice = await showOwnedOpenDialog(event, { title: '选择 SoundBot 数据目录', properties: ['openDirectory', 'createDirectory'] });
+  if (choice.canceled || !choice.filePaths?.length) return { canceled: true };
+  const target = choice.filePaths[0];
+  const existing = ['db', 'chroma_projects', 'metadata-repair-progress.sqlite'].some(name => fs.existsSync(path.join(target, name)));
+  const confirm = await dialog.showMessageBox(mainWindow, {
+    type: 'question', title: '更改数据目录', defaultId: 1, cancelId: 1,
+    message: existing ? '目标目录已有 SoundBot 数据' : '迁移 SoundBot 数据',
+    detail: `${target}\n\n${existing ? '直接使用目标目录的数据，不会覆盖它。' : '复制并校验数据库后切换目录。'}旧数据会改名保留。请先暂停所有工程的索引/导入并等待结束；迁移期间不要退出应用。`,
+    buttons: [existing ? '直接使用目标数据' : '迁移并使用', '取消']
+  });
+  if (confirm.response !== 0) return { canceled: true };
+  storageChanging = true;
+  try {
+    const result = await switchStorage({ target, useExisting: existing }, {
+      stop: stopBackendForStorage, tool: runStorageTool,
+      start: paused => startBackend({ paused }), resume: () => desktopControl('resume')
+    });
+    if (result.warning) await dialog.showMessageBox(mainWindow, { type: 'warning', message: result.warning });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+    return result;
+  } finally { storageChanging = false; }
+}
+
 function createWindow() {
   rendererBridgeReady = false;
   rendererPreloadFailure = null;
@@ -1208,6 +1313,9 @@ function createWindow() {
     titleBarStyle: 'default',
     show: false,
     backgroundColor: '#0a0a0a'
+  });
+  mainWindow.on('close', event => {
+    if (storageChanging) event.preventDefault();
   });
 
   // A preload failure removes every desktop API from the renderer while the
@@ -1385,6 +1493,12 @@ function setupIpcHandlers() {
 
   ipcMain.handle('dialog-message', async (event, options) => {
     return await dialog.showMessageBox(mainWindow, options);
+  });
+
+  ipcMain.handle('storage-directory', async (event, action) => {
+    if (action === 'get') return storageInfo();
+    if (action === 'change') return chooseDataDirectory(event);
+    throw new Error('Unknown storage action');
   });
 
   // 后端 API 代理
@@ -1869,6 +1983,7 @@ app.on('activate', () => {
 });
 
 app.on('before-quit', async (event) => {
+  if (storageChanging) { event.preventDefault(); return; }
   if (quitInProgress) {
     return;
   }

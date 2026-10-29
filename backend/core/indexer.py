@@ -80,7 +80,7 @@ def safe_project_chroma_path(project_id: str, *, create: bool = True) -> Path:
     ):
         raise ValueError("工程 ID 包含非法字符")
 
-    root = (config.get_user_data_dir() / "chroma_projects").resolve(strict=False)
+    root = (config.get_data_dir() / "chroma_projects").resolve(strict=False)
     candidate = (root / value).resolve(strict=False)
     try:
         candidate.relative_to(root)

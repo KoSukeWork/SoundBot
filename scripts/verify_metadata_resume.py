@@ -14,6 +14,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     data = Path(tempfile.mkdtemp(prefix='metadata-real-', dir=root / '.test-data'))
     os.environ['SOUNDBOT_USER_DATA_DIR'] = str(data)
+    os.environ['SOUNDBOT_DATA_DIR'] = str(data)
     # Set SOUNDBOT_MODELS_PATH before invoking this script if necessary.
     sys.path.insert(0,str(root / 'backend'))
     import torch
