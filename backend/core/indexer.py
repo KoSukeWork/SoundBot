@@ -147,11 +147,60 @@ def collection_uses_cosine(collection: Any) -> bool:
     return metadata.get("hnsw:space") == COSINE_SPACE
 
 
+_MAX_FINGERPRINT_PROBES = 16
+
+
 def collection_engine_fingerprints(collection: Any) -> Tuple[set[str], bool]:
     """Return every persisted engine fingerprint and whether any row lacks one."""
     count = int(collection.count())
     if count <= 0:
         return set(), False
+    # Every search runs this check, and a probe costs ~2s at 830k rows. Reuse
+    # the answer until this process writes again: each Chroma write here is
+    # followed by bump_collection_revision, which starts a new generation.
+    key = getattr(collection, "id", None)
+    with _revision_lock:
+        generation = _write_generation
+        cached = _engine_state_cache.get(str(key)) if key is not None else None
+    if cached is not None and cached[:2] == (generation, count):
+        return set(cached[2]), cached[3]
+    fingerprints, unknown = _probe_engine_fingerprints(collection, count)
+    if key is not None:
+        with _revision_lock:
+            if _write_generation == generation:
+                _engine_state_cache[str(key)] = (
+                    generation, count, frozenset(fingerprints), unknown
+                )
+    return fingerprints, unknown
+
+
+def _probe_engine_fingerprints(collection: Any, count: int) -> Tuple[set[str], bool]:
+    # Each probe asks for one row whose value is not seen yet; Chroma's $nin
+    # also matches rows without the key. A healthy collection holds one engine,
+    # so two limit=1 probes replace a metadata scan that paged by offset and
+    # took about an hour per collection at 830k rows.
+    fingerprints: set[str] = set()
+    unknown = False
+    seen_values: List[str] = []
+    for _ in range(_MAX_FINGERPRINT_PROBES):
+        where = {"engine_fingerprint": {"$nin": seen_values}} if seen_values else None
+        snapshot = collection.get(where=where, limit=1, include=["metadatas"])
+        metadatas = snapshot.get("metadatas") or []
+        if not metadatas:
+            return fingerprints, unknown
+        value = (metadatas[0] or {}).get("engine_fingerprint")
+        if not isinstance(value, str):
+            break  # $nin cannot exclude a missing or non-string value.
+        seen_values.append(value)
+        if value.strip():
+            fingerprints.add(value.strip())
+        else:
+            unknown = True
+    return _scan_engine_fingerprints(collection, count)
+
+
+def _scan_engine_fingerprints(collection: Any, count: int) -> Tuple[set[str], bool]:
+    """Exact fallback for legacy rows that the indexed probes cannot exclude."""
     fingerprints: set[str] = set()
     unknown = False
     seen = 0
@@ -174,6 +223,8 @@ _chroma_clients: Dict[str, chromadb.PersistentClient] = {}
 _clients_lock = threading.RLock()
 _collection_revisions: Dict[str, int] = {}
 _revision_lock = threading.RLock()
+_write_generation = 0
+_engine_state_cache: Dict[str, Tuple[int, int, frozenset, bool]] = {}
 
 
 def _revision_key(persist_directory: str, collection_name: str) -> str:
@@ -189,8 +240,11 @@ def get_collection_revision(persist_directory: str, collection_name: str) -> int
 
 
 def bump_collection_revision(persist_directory: str, collection_name: str) -> int:
+    global _write_generation
     key = _revision_key(persist_directory, collection_name)
     with _revision_lock:
+        _write_generation += 1
+        _engine_state_cache.clear()
         _collection_revisions[key] = _collection_revisions.get(key, 0) + 1
         return _collection_revisions[key]
 
