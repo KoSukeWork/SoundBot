@@ -60,6 +60,30 @@ class DatabaseV2Tests(unittest.TestCase):
             manager._local.conn = None
         self.assertIn("COVERING INDEX idx_files_keyword", " ".join(str(step[-1]) for step in plan))
 
+    def test_ready_artifact_lookup_uses_primary_key_not_state_scan(self) -> None:
+        manager = DatabaseManager(str(self.root / "ready.db"))
+        file_ids = []
+        for name in ("ready.wav", "pending.wav"):
+            audio = self.root / name
+            audio.write_bytes(b"RIFF-test")
+            file_ids.append(manager.upsert_file(AudioFileRecord(path=str(audio), filename=name), "default"))
+        manager.set_artifact_state("default", file_ids[0], "audio_vector", "ready")
+        connection = manager._get_connection()
+        statements = []
+        connection.set_trace_callback(statements.append)
+        try:
+            ready = manager.get_ready_artifact_ids("default", "audio_vector", [*file_ids, "missing"])
+            query = next(sql for sql in statements if "FROM file_artifacts" in sql)
+            plan = " ".join(str(step[-1]) for step in connection.execute(
+                "EXPLAIN QUERY PLAN " + query).fetchall())
+        finally:
+            connection.set_trace_callback(None)
+            connection.close()
+            manager._local.conn = None
+        self.assertEqual(ready, {file_ids[0]})
+        self.assertIn("sqlite_autoindex_file_artifacts_1", plan)
+        self.assertNotIn("idx_file_artifacts_state", plan)
+
     def test_fresh_database_creates_artifact_state_and_metadata_page(self) -> None:
         manager = DatabaseManager(str(self.root / "fresh.db"))
         audio = self.root / "中文 %_ tone.wav"

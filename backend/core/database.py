@@ -1846,13 +1846,16 @@ class DatabaseManager:
             batch = selected[offset : offset + 500]
             placeholders = ",".join("?" for _ in batch)
             with self.get_cursor() as cursor:
+                # Unary + keeps SQLite on primary-key lookups. Otherwise it
+                # picks idx_file_artifacts_state and scans every ready row per
+                # batch (0.7 s warm, 11 s cold at 830k rows, versus 5 ms).
                 rows = cursor.execute(
                     f"""
                     SELECT file_uuid FROM file_artifacts
-                    WHERE project_id=? AND kind=? AND state='ready'
-                      AND file_uuid IN ({placeholders})
+                    WHERE project_id=? AND file_uuid IN ({placeholders})
+                      AND +kind=? AND +state='ready'
                     """,
-                    (project_id, kind, *batch),
+                    (project_id, *batch, kind),
                 ).fetchall()
             ready.update(str(row["file_uuid"]) for row in rows)
         return ready
