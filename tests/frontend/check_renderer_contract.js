@@ -72,7 +72,14 @@ async function main() {
   assert(indexHtml.includes('rendererWaveform.renderMain(canvas'), 'main waveform is not rendered by the cached module');
   assert(indexHtml.includes('rendererAudio.resolvePlaybackSource(sound'), 'playback-source selection is not wired');
   assert(indexHtml.includes('r.metadata?.file_id'), 'AI results do not preserve stable file IDs');
-  assert(indexHtml.includes('selectAndPlaySound(soundObj);'), 'AI result playback is not an explicit select-and-play action');
+  assert(
+    /function displayAiSearchResults[\s\S]*?renderSoundList\('', allSearchResults\);/.test(indexHtml),
+    'AI results do not use the shared list rows'
+  );
+  assert(indexHtml.includes('selectAndPlaySound(sound);'), 'list playback is not an explicit select-and-play action');
+  assert(indexHtml.includes("moveCurrentSound(e.key === 'ArrowDown' ? 1 : -1"), 'arrow keys do not move through the list');
+  assert(indexHtml.includes("localStorage.setItem('soundbot_autoplay'"), 'autoplay preference is not remembered');
+  assert(indexHtml.includes('if (stale()) return;'), 'superseded playback loads are not discarded');
   assert(indexHtml.includes('rendererSearch.buildPayload({'), 'search payload module is not wired');
   assert(indexHtml.includes("rendererApi.post('/api/v1/search', searchRequest)"), 'project-scoped search request is not wired');
   assert(indexHtml.includes('rendererProjects.listFiles('), 'cursor file API is not wired');

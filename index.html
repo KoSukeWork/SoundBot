@@ -80,6 +80,7 @@
         .sound-row { transition: all 0.15s ease; }
         .sound-row:hover { background-color: rgba(128, 128, 128, 0.05); }
         .sound-row.selected { background-color: rgba(128, 128, 128, 0.15); }
+        .sound-row.current { background-color: rgba(128, 128, 128, 0.2); box-shadow: inset 3px 0 0 var(--text-primary); }
         
         .dropdown-menu { transform-origin: top right; transition: all 0.15s ease; }
         .dropdown-menu.hidden { opacity: 0; transform: scale(0.95); pointer-events: none; }
@@ -466,6 +467,9 @@
             <button id="loopBtn" class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors hover:bg-black/5 dark:hover:bg-white/5 opacity-50" data-i18n-title="player.loop">
                 <i data-lucide="repeat" class="w-5 h-5"></i>
             </button>
+            <button id="autoplayBtn" class="w-9 h-9 rounded-lg flex items-center justify-center transition-colors hover:bg-black/5 dark:hover:bg-white/5" data-i18n-title="player.autoplay">
+                <i data-lucide="mouse-pointer-click" class="w-5 h-5"></i>
+            </button>
         </div>
         
         <!-- Progress Bar -->
@@ -690,6 +694,8 @@
         let currentSound = null;
         let isPlaying = false;
         let isLooping = false;
+        let autoPlayOnSelect = localStorage.getItem('soundbot_autoplay') !== 'false';
+        let playLoadToken = 0;
         let playbackProgress = 0;
         let playbackInterval = null;
         let selectedSounds = new Set();
@@ -1027,13 +1033,7 @@
                     // 播放结束时释放 Blob URL，防止内存泄漏
                     releaseCurrentBlobUrl();
                     updatePlaybackUI();
-                    // 如果有搜索结果（包括AI搜索），保持显示搜索结果；否则显示正常列表
-                    const searchQuery = document.getElementById('searchInput').value.trim();
-                    if (allSearchResults.length > 0) {
-                        renderSoundList('', allSearchResults);
-                    } else {
-                        renderSoundList(searchQuery);
-                    }
+                    updatePlayButtonState();
                 }
             });
             audioPlayer.addEventListener('timeupdate', () => {
@@ -1059,6 +1059,9 @@
 
         async function loadAndPlaySound(sound) {
             console.log('[loadAndPlaySound] 开始播放:', sound);
+            // 快速切换时旧的加载可能晚于新的完成，过期的加载直接放弃
+            const token = ++playLoadToken;
+            const stale = () => token !== playLoadToken || currentSound !== sound;
 
             try {
                 if (!sound.filePath) {
@@ -1080,6 +1083,7 @@
                     api: rendererApi,
                     projectId: currentProject?.id || 'default'
                 });
+                if (stale()) return;
                 console.log('[Frontend] 播放音频源:', audioSrc);
 
                 // 先暂停当前播放的音频
@@ -1095,6 +1099,7 @@
                 console.log('[loadAndPlaySound] 开始播放...');
 
                 await rendererAudio.waitForMetadata(audioPlayer);
+                if (stale()) return;
 
                 // 尝试播放
                 try {
@@ -1103,11 +1108,13 @@
                     startPlaybackAnimation(); // 启动毫秒级动画更新
                     console.log('[loadAndPlaySound] 播放成功');
                 } catch (playError) {
+                    if (stale()) return;
                     console.error('[loadAndPlaySound] 播放失败:', playError);
                     // 如果本地协议失败，回退到后端文件直出接口；仍然避免整文件 IPC 搬运。
                     if (window.electronAPI?.backendAPI?.getAudioUrl) {
                         try {
                             const fallback = await window.electronAPI.backendAPI.getAudioUrl(sound.filePath);
+                            if (stale()) return;
                             if (!fallback?.url) {
                                 throw playError;
                             }
@@ -1115,11 +1122,13 @@
                             audioPlayer.src = audioSrc;
                             audioPlayer.load();
                             await rendererAudio.waitForMetadata(audioPlayer);
+                            if (stale()) return;
                             await audioPlayer.play();
                             isPlaying = true;
                             startPlaybackAnimation(); // 启动毫秒级动画更新
                             console.log('[loadAndPlaySound] 后备方案播放成功');
                         } catch (e2) {
+                            if (stale()) return;
                             console.error('[loadAndPlaySound] 后备方案也失败:', e2);
                             showNotification('播放失败: ' + e2.message, 'error');
                         }
@@ -1129,15 +1138,10 @@
                 }
 
                 updatePlaybackUI();
-                // 如果有搜索结果（包括AI搜索），保持显示搜索结果；否则显示正常列表
-                const searchQuery = document.getElementById('searchInput').value.trim();
-                if (allSearchResults.length > 0) {
-                    renderSoundList('', allSearchResults);
-                } else {
-                    renderSoundList(searchQuery);
-                }
+                updatePlayButtonState();
 
             } catch (error) {
+                if (stale()) return;
                 console.error('[loadAndPlaySound] 总体错误:', error);
                 if (typeof showNotification === 'function') {
                     showNotification('播放失败: ' + error.message, 'error');
@@ -1750,14 +1754,14 @@
             }
             
             filteredSounds.forEach(sound => {
+                const isCurrent = currentSound && currentSound.id === sound.id;
+
                 const row = document.createElement('div');
-                row.className = `sound-row flex items-center px-4 py-3 border-b cursor-pointer ${selectedSounds.has(sound.id) ? 'selected' : ''}`;
+                row.className = `sound-row flex items-center px-4 py-3 border-b cursor-pointer ${selectedSounds.has(sound.id) ? 'selected' : ''} ${isCurrent ? 'current' : ''}`;
                 row.style.borderColor = 'var(--border-color)';
                 row.dataset.id = sound.id;
                 row.draggable = true;
-                
-                const isCurrent = currentSound && currentSound.id === sound.id;
-                
+
                 // 拖拽事件
                 row.addEventListener('dragstart', (e) => {
                     e.dataTransfer.setData('text/plain', sound.filePath || '');
@@ -1831,7 +1835,7 @@
                     </div>
                     <div class="w-24 text-right text-sm opacity-70 font-mono">${formatTime(sound.duration)}</div>
                     <div class="w-16 flex justify-center">
-                        <button class="play-sound-btn w-7 h-7 rounded-full border flex items-center justify-center transition-all hover:scale-110" data-id="${sound.id}"
+                        <button class="play-sound-btn w-7 h-7 rounded-full border flex items-center justify-center transition-all hover:scale-110" data-id="${sound.id}" data-icon="${isCurrent && isPlaying ? 'pause' : 'play'}"
                                 style="border-color: var(--border-color);">
                             <i data-lucide="${isCurrent && isPlaying ? 'pause' : 'play'}" class="w-3.5 h-3.5"></i>
                         </button>
@@ -1848,12 +1852,24 @@
                         }
                         row.classList.toggle('selected', checkbox.checked);
                     } else if (e.target.closest('.play-sound-btn')) {
-                        playSound(sound);
+                        if (currentSound && currentSound.id === sound.id) {
+                            playSound(sound);
+                        } else {
+                            selectAndPlaySound(sound);
+                        }
+                    } else if (autoPlayOnSelect) {
+                        selectAndPlaySound(sound);
                     } else {
                         selectSound(sound);
                     }
                 });
-                
+
+                // 关闭自动播放时，双击条目播放
+                row.addEventListener('dblclick', (e) => {
+                    if (autoPlayOnSelect || e.target.closest('.sound-checkbox, .play-sound-btn')) return;
+                    selectAndPlaySound(sound);
+                });
+
                 container.appendChild(row);
             });
             
@@ -1982,7 +1998,9 @@
             if (audioPlayer) {
                 audioPlayer.pause();
             }
-            
+            isPlaying = false;
+            stopPlaybackAnimation();
+
             // 选择新音频时清除选区和相关状态
             selectionStart = null;
             selectionEnd = null;
@@ -2008,6 +2026,7 @@
             
             // 只更新选中状态，不重绘整个列表
             updateSelectionState(previousSound, sound);
+            updatePlayButtonState();
         }
         
         // 预加载音频元数据，不读取或解码整文件
@@ -2038,7 +2057,7 @@
             if (previousSound) {
                 const prevRow = document.querySelector(`.sound-row[data-id="${previousSound.id}"]`);
                 if (prevRow) {
-                    prevRow.classList.remove('selected');
+                    prevRow.classList.remove('current');
                     // 重绘之前选中的波形（恢复非高亮状态）
                     drawSingleMiniWaveform(previousSound.id);
                 }
@@ -2048,7 +2067,7 @@
             if (newSound) {
                 const newRow = document.querySelector(`.sound-row[data-id="${newSound.id}"]`);
                 if (newRow) {
-                    newRow.classList.add('selected');
+                    newRow.classList.add('current');
                     // 重绘新选中的波形（高亮状态）
                     drawSingleMiniWaveform(newSound.id);
                 }
@@ -2274,9 +2293,12 @@
             document.querySelectorAll('.play-sound-btn').forEach(btn => {
                 const soundId = String(btn.dataset.id);
                 const isCurrent = currentSound && String(currentSound.id) === soundId;
-                const icon = btn.querySelector('i');
-                if (icon) {
-                    icon.setAttribute('data-lucide', isCurrent && isPlaying ? 'pause' : 'play');
+                // lucide 已把 <i> 换成 <svg>，只重建图标真正变化的按钮
+                const icon = isCurrent && isPlaying ? 'pause' : 'play';
+                if (btn.dataset.icon !== icon) {
+                    btn.dataset.icon = icon;
+                    btn.innerHTML = `<i data-lucide="${icon}" class="w-3.5 h-3.5"></i>`;
+                    lucide.createIcons({ root: btn });
                 }
                 // 更新播放指示器
                 const row = btn.closest('.sound-row');
@@ -2297,7 +2319,6 @@
                     }
                 }
             });
-            lucide.createIcons();
         }
         
         function stopPlayback() {
@@ -2314,7 +2335,7 @@
             playbackProgress = 0;
             stopPlaybackAnimation(); // 停止动画更新
             updatePlaybackUI();
-            renderSoundList(document.getElementById('searchInput').value);
+            updatePlayButtonState();
         }
 
         function updatePlaybackUI() {
@@ -2693,19 +2714,13 @@
         }
 
         function displayAiSearchResults(results) {
-            // 将 AI 搜索结果转换为 soundData 格式并显示
-            const container = document.getElementById('soundList');
-            
-            // 清空现有内容
-            container.innerHTML = '';
-            
-            // 保存到 allSearchResults，这样播放结束时不会刷新回默认列表
+            // 将 AI 搜索结果转换为 soundData 格式，用和普通列表相同的行显示（高亮、键盘切换一致）
             allSearchResults = results.map((r, index) => ({
                 id: r.file_id || r.id || r.metadata?.file_id || `ai-result-${index}`,
                 fileId: r.file_id || r.id || r.metadata?.file_id || null,
                 name: r.filename,
                 filePath: r.file_path || r.path,
-                duration: r.duration,
+                duration: (r.duration || 0) * 1000,
                 format: r.format,
                 similarity: r.similarity,
                 tags: ['AI搜索']
@@ -2717,91 +2732,13 @@
                 headerText.textContent = `AI 搜索结果 (${results.length})`;
             }
 
-            results.forEach((result, index) => {
-                const file = result;
-                const filePath = file.file_path || file.path; // 兼容两种字段名
-                const soundItem = document.createElement('div');
-                soundItem.className = 'sound-item flex items-center py-2 px-4 border-b cursor-pointer hover:bg-black/5 dark:hover:bg-white/5 transition-colors';
-                soundItem.style.borderColor = 'var(--border-color)';
-                soundItem.dataset.path = filePath;
-                soundItem.dataset.index = index;
-
-                soundItem.innerHTML = `
-                    <div class="w-10 flex justify-center"><input type="checkbox" class="sound-checkbox w-4 h-4 rounded border-gray-300"></div>
-                    <div class="w-12 flex justify-center">
-                        <div class="w-8 h-8 rounded border flex items-center justify-center text-xs" style="border-color: var(--border-color);">
-                            ${index + 1}
-                        </div>
-                    </div>
-                    <div class="w-12 flex justify-center">
-                        <div class="w-8 h-8 rounded border flex items-center justify-center text-xs" style="background-color: var(--bg-tertiary); border-color: var(--border-color);">
-                            <i data-lucide="music" class="w-4 h-4"></i>
-                        </div>
-                    </div>
-                    <div class="flex-1 min-w-0 flex items-center gap-2">
-                        <div class="flex-1 min-w-0">
-                            <div class="text-sm font-medium truncate" style="color: var(--text-primary);">${escapeHtml(file.filename)}</div>
-                            <div class="text-xs truncate opacity-60" style="color: var(--text-secondary);">${escapeHtml(filePath)}</div>
-                        </div>
-                    </div>
-                    <div class="w-24 text-right text-sm font-mono" style="color: var(--text-secondary);">${formatDuration(file.duration)}</div>
-                    <div class="w-16 flex justify-center">
-                        <button class="p-1 rounded hover:bg-black/10 dark:hover:bg-white/10 play-btn" data-i18n-title="player.play" data-path="${escapeHtml(filePath)}">
-                            <i data-lucide="play" class="w-4 h-4"></i>
-                        </button>
-                    </div>
-                `;
-
-                soundItem.addEventListener('click', (e) => {
-                    const stableFileId = file.file_id || file.id || file.metadata?.file_id || null;
-                    if (e.target.closest('.play-btn')) {
-                        e.stopPropagation();
-                        const path = e.target.closest('.play-btn').dataset.path;
-                        // Reuse the single async playback path so transcoded
-                        // formats wait for a fresh backend-owned WAV source.
-                        const soundObj = {
-                            id: stableFileId || `ai-result-${index}`,
-                            fileId: stableFileId,
-                            path: path,
-                            filename: file.filename,
-                            name: file.filename,
-                            duration: file.duration,
-                            filePath: path
-                        };
-                        selectAndPlaySound(soundObj);
-                    } else if (e.target.closest('input[type="checkbox"]')) {
-                        // 复选框点击不触发选择
-                    } else {
-                        // 选中音效
-                        const soundObj = {
-                            id: stableFileId || `ai-result-${index}`,
-                            fileId: stableFileId,
-                            path: filePath,
-                            filename: file.filename,
-                            name: file.filename,
-                            duration: file.duration,
-                            filePath: filePath
-                        };
-                        selectSound(soundObj);
-                    }
-                });
-
-                container.appendChild(soundItem);
-            });
-
-            lucide.createIcons();
+            renderSoundList('', allSearchResults);
 
             // 滚动到列表顶部
-            container.scrollTop = 0;
+            document.getElementById('soundList').scrollTop = 0;
 
             // 显示通知
             showNotification(`AI 搜索完成，找到 ${results.length} 个相关音效`, 'success');
-        }
-
-        function formatDuration(seconds) {
-            const mins = Math.floor(seconds / 60);
-            const secs = Math.floor(seconds % 60);
-            return `${mins}:${secs.toString().padStart(2, '0')}`;
         }
 
         // ==================== SETTINGS MODAL ====================
@@ -4962,19 +4899,8 @@
             soundListContainer.addEventListener('scroll', () => {
                 queueVisibleWaveformLoad(lastRenderedSounds);
                 const { scrollTop, scrollHeight, clientHeight } = soundListContainer;
-                const nearBottom = scrollTop + clientHeight >= scrollHeight - 100;
-                if (!currentSearchQuery) {
-                    if (nearBottom && fileListNextCursor && !fileListLoading) {
-                        loadFilesFromDatabase({ reset: false });
-                    }
-                    return;
-                }
-                if (isLoadingMore || !hasMoreResults) return;
-
                 // 当滚动到距离底部 100px 时加载更多
-                if (nearBottom) {
-                    loadSearchResults(currentSearchQuery, currentSearchPage + 1);
-                }
+                if (scrollTop + clientHeight >= scrollHeight - 100) loadMoreListItems();
             });
             
             // Select All
@@ -5064,22 +4990,78 @@
                 document.getElementById('loopBtn').classList.toggle('text-primary-500', isLooping);
             });
             
-            document.getElementById('prevBtn').addEventListener('click', () => {
-                if (!currentSound) return;
-                const currentIndex = soundData.findIndex(s => s.id === currentSound.id);
-                const prevIndex = currentIndex > 0 ? currentIndex - 1 : soundData.length - 1;
-                selectSound(soundData[prevIndex]);
-                startPlayback();
+            const autoplayBtn = document.getElementById('autoplayBtn');
+            const updateAutoplayButton = () => {
+                autoplayBtn.classList.toggle('opacity-50', !autoPlayOnSelect);
+                autoplayBtn.classList.toggle('text-primary-500', autoPlayOnSelect);
+            };
+            updateAutoplayButton();
+            autoplayBtn.addEventListener('click', () => {
+                autoPlayOnSelect = !autoPlayOnSelect;
+                localStorage.setItem('soundbot_autoplay', String(autoPlayOnSelect));
+                updateAutoplayButton();
             });
-            
-            document.getElementById('nextBtn').addEventListener('click', () => {
-                if (!currentSound) return;
-                const currentIndex = soundData.findIndex(s => s.id === currentSound.id);
-                const nextIndex = currentIndex < soundData.length - 1 ? currentIndex + 1 : 0;
-                selectSound(soundData[nextIndex]);
-                startPlayback();
-            });
-            
+
+            // ==================== LIST NAVIGATION ====================
+            let navigationPlayTimer = null;
+            let navigationLoading = false;
+
+            // 当前列表正好显示到分页列表的末尾时，加载下一页；返回是否加载了。
+            // AI 结果、分类筛选不是分页列表，不翻页
+            async function loadMoreListItems() {
+                const last = lastRenderedSounds.at(-1);
+                if (currentSearchQuery) {
+                    if (!hasMoreResults || isLoadingMore || last !== allSearchResults.at(-1)) return false;
+                    await loadSearchResults(currentSearchQuery, currentSearchPage + 1);
+                    return true;
+                }
+                if (!fileListNextCursor || fileListLoading || last !== soundData.at(-1)) return false;
+                await loadFilesFromDatabase({ reset: false });
+                return true;
+            }
+
+            function goToSound(sound, { play = autoPlayOnSelect, delayPlay = false } = {}) {
+                if (!sound || (currentSound && String(currentSound.id) === String(sound.id))) return;
+                clearTimeout(navigationPlayTimer);
+                if (play) {
+                    selectSound(sound, { preload: false });
+                    // 按住方向键连续切换时，停下来再播放，不为每一条都去加载音频
+                    navigationPlayTimer = setTimeout(() => {
+                        if (currentSound === sound) playSound(sound, { forcePlay: true });
+                    }, delayPlay ? 150 : 0);
+                } else {
+                    selectSound(sound);
+                }
+                document.querySelector(`.sound-row[data-id="${CSS.escape(String(sound.id))}"]`)
+                    ?.scrollIntoView({ block: 'nearest' });
+            }
+
+            async function moveCurrentSound(step, options = {}) {
+                if (navigationLoading || lastRenderedSounds.length === 0) return;
+                const currentIndex = () => currentSound
+                    ? lastRenderedSounds.findIndex(s => String(s.id) === String(currentSound.id))
+                    : -1;
+                let index = currentIndex();
+                if (index === -1) {
+                    goToSound(lastRenderedSounds[step > 0 ? 0 : lastRenderedSounds.length - 1], options);
+                    return;
+                }
+                if (index + step >= lastRenderedSounds.length) {
+                    navigationLoading = true;
+                    try {
+                        if (!await loadMoreListItems()) return;
+                    } finally {
+                        navigationLoading = false;
+                    }
+                    index = currentIndex();
+                    if (index === -1) return;
+                }
+                goToSound(lastRenderedSounds[Math.max(0, Math.min(index + step, lastRenderedSounds.length - 1))], options);
+            }
+
+            document.getElementById('prevBtn').addEventListener('click', () => moveCurrentSound(-1, { play: true }));
+            document.getElementById('nextBtn').addEventListener('click', () => moveCurrentSound(1, { play: true }));
+
 // Progress Bar
             document.getElementById('progressContainer').addEventListener('click', (e) => {
                 if (!currentSound) return;
@@ -5687,11 +5669,37 @@
                 }
             });
 
-            // 空格键播放/暂停控制
+            function isTextEntry(element) {
+                if (!element) return false;
+                if (element.isContentEditable || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') return true;
+                return element.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'range'].includes(element.type);
+            }
+
+            // 键盘：空格播放/暂停，↑↓ 切换条目，Home/End 第一条/最后一条，Enter 从头播放
             document.addEventListener('keydown', (e) => {
-                // 如果焦点在输入框中，不响应空格键
-                if (document.activeElement.tagName === 'INPUT' ||
-                    document.activeElement.tagName === 'TEXTAREA') {
+                if (e.ctrlKey || e.metaKey || e.altKey) return;
+                if (document.querySelector('.fixed.inset-0[id$="Modal"]:not(.hidden)')) return;
+                if (isTextEntry(document.activeElement)) {
+                    // 在搜索框里按 ↓ 进入结果列表，其他输入框照常打字
+                    if (e.key !== 'ArrowDown' || document.activeElement.id !== 'searchInput') return;
+                    document.activeElement.blur();
+                }
+
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    moveCurrentSound(e.key === 'ArrowDown' ? 1 : -1, { delayPlay: e.repeat });
+                    return;
+                }
+                if (e.key === 'Home' || e.key === 'End') {
+                    e.preventDefault();
+                    goToSound(lastRenderedSounds[e.key === 'Home' ? 0 : lastRenderedSounds.length - 1]);
+                    return;
+                }
+                if (e.key === 'Enter') {
+                    if (!currentSound || e.target.closest?.('button, a')) return;
+                    e.preventDefault();
+                    clearTimeout(navigationPlayTimer);
+                    playSound(currentSound, { forcePlay: true });
                     return;
                 }
 
