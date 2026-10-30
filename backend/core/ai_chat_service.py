@@ -141,7 +141,7 @@ class AIChatService:
         self,
         message: str,
         conversation_history: Optional[List[Dict[str, str]]] = None,
-        top_k: int = 20,
+        top_k: int = 400,
         threshold: float = 0.1,
         project_id: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:

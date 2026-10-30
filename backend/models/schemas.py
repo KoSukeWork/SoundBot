@@ -280,7 +280,7 @@ class AIChatRequest(BaseModel):
     message: str = Field(..., description="用户消息")
     project_id: str = Field(default="default", description="搜索所属工程 ID")
     history: Optional[List[Dict[str, str]]] = Field(default=[], description="对话历史")
-    top_k: int = Field(default=20, ge=1, le=100, description="返回结果数量")
+    top_k: int = Field(default=400, ge=1, le=1000, description="返回结果数量（与搜索框相同上限）")
     threshold: float = Field(default=0.1, ge=0.0, le=1.0, description="相似度阈值")
 
 

@@ -193,6 +193,12 @@ async function main() {
     modules.search.buildChatPayload({ message: 'hit', projectId: 'project-a' }).project_id,
     'project-a'
   );
+  assert.strictEqual(
+    modules.search.buildChatPayload({ message: 'hit', projectId: 'project-a' }).top_k,
+    modules.search.DEFAULT_TOP_K,
+    'AI chat returns fewer results than the search box'
+  );
+  assert(indexHtml.includes('topK: 400,\n                        threshold: 0.1'), 'AI chat request asks for fewer results than the search box');
 
   const normalSource = await modules.audio.resolvePlaybackSource({ filePath: '/tmp/test.wav', fileId: 'wav-id' });
   assert(normalSource.startsWith('soundmind-audio://local/'));

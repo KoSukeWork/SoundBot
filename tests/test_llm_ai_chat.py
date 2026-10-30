@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from core.ai_chat_service import AIChatService
+from models import schemas
 from core.searcher import SearchResult
 
 
@@ -162,6 +163,10 @@ class AIChatServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             payload["results"][0]["metadata"]["file_id"], "stable-wma-id"
         )
+
+    def test_chat_returns_as_many_results_as_the_search_box(self):
+        self.assertEqual(schemas.AIChatRequest(message="rain").top_k, 400)
+        self.assertEqual(schemas.AIChatRequest(message="rain", top_k=1000).top_k, 1000)
 
     def test_json_extractor_accepts_fenced_and_prefixed_object(self):
         value = AIChatService._extract_json(

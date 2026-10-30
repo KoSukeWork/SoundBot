@@ -32,9 +32,9 @@
     function buildChatPayload(options = {}) {
         const search = buildPayload({
             query: options.message,
-            topK: options.topK || 20,
+            topK: options.topK || DEFAULT_TOP_K,
             threshold: options.threshold ?? 0.1,
-            pageSize: options.topK || 20,
+            pageSize: options.topK || DEFAULT_TOP_K,
             projectId: options.projectId
         });
         return {
