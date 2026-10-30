@@ -4075,7 +4075,8 @@ async def ai_chat(request: schemas.AIChatRequest):
     - thinking: 正在分析
     - analyzing: 分析完成
     - searching: 正在搜索
-    - results: 搜索结果
+    - warning: 模型不可用，改为按原文直接搜索（附原因）
+    - results: 搜索结果（fallback=true 表示模型未参与）
     - error: 错误
     - done: 完成
     """

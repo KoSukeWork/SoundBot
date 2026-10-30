@@ -105,6 +105,27 @@ class LLMClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret provider diagnostic", str(chunks[0]))
         await http.aclose()
 
+    async def test_streamed_server_error_reports_status_and_logs_a_masked_body(self):
+        async def handler(_request: httpx.Request):
+            return httpx.Response(
+                503, json={"error": {"message": "no channel for test-model, key secret"}}
+            )
+
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = LLMClient(llm_config(), client=http, max_retries=0)
+        with self.assertLogs("core.llm_client", level="WARNING") as logs:
+            chunks = [
+                chunk
+                async for chunk in client.chat([{"role": "user", "content": "hi"}])
+            ]
+        self.assertEqual(chunks[0]["code"], "provider_unavailable")
+        self.assertIn("HTTP 503", chunks[0]["message"])
+        self.assertNotIn("no channel", str(chunks[0]))
+        logged = "\n".join(logs.output)
+        self.assertIn("no channel for test-model", logged)
+        self.assertNotIn("secret", logged)
+        await http.aclose()
+
     async def test_retryable_server_error_retries_before_returning(self):
         calls = 0
 

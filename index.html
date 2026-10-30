@@ -966,6 +966,7 @@
             .notification.success { border-left: 4px solid #10b981; }
             .notification.error { border-left: 4px solid #ef4444; }
             .notification.info { border-left: 4px solid #3b82f6; }
+            .notification.warning { border-left: 4px solid #f59e0b; }
         `;
         document.head.appendChild(notificationStyle);
         
@@ -2607,7 +2608,7 @@
                 });
 
                 if (!response.ok) {
-                    throw new Error('请求失败');
+                    throw new Error(`请求失败 (HTTP ${response.status})`);
                 }
 
                 const reader = response.body.getReader();
@@ -2632,17 +2633,20 @@
                             const data = line.slice(6);
                             if (data === '[DONE]' || data === '{"type": "done"}') continue;
 
+                            let event;
                             try {
-                                const event = JSON.parse(data);
-                                if (event.type === 'chat' && event.content) {
-                                    fullContent += event.content;
-                                } else if (event.type === 'results' && event.summary) {
-                                    fullContent += event.summary;
-                                }
-                                await processAiEvent(event);
+                                event = JSON.parse(data);
                             } catch (e) {
-                                // 忽略解析错误
+                                console.warn('[AI Chat] 无法解析的事件:', data);
+                                continue;
                             }
+                            if (event.type === 'chat' && event.content) {
+                                fullContent += event.content;
+                            } else if (event.type === 'results' && event.summary) {
+                                fullContent += event.summary;
+                            }
+                            // 处理出错要冒泡到下面的 catch 显示出来，不能吞掉
+                            await processAiEvent(event);
                         }
                     }
                     if (done) break;
@@ -2657,17 +2661,9 @@
                 console.error('AI Chat 错误:', error);
                 removeLoadingMessage();
                 
-                // 提供更友好的错误信息
-                let errorMsg = '抱歉，AI 服务暂时不可用。';
-                if (error.message && error.message.includes('fetch')) {
-                    errorMsg += '请检查后端服务是否已启动（端口 8000）。';
-                } else if (error.message) {
-                    errorMsg += `错误信息：${error.message}`;
-                } else {
-                    errorMsg += '请检查 AI 服务配置是否正确。';
-                }
-                
+                const errorMsg = `AI 对话失败：${error?.message || error}`;
                 addChatMessage(errorMsg);
+                showNotification(errorMsg, 'error');
             } finally {
                 isAiResponding = false;
             }
@@ -2687,6 +2683,12 @@
                     updateLoadingMessage(event.content || '搜索中...');
                     break;
 
+                case 'warning':
+                    // 模型出错时后端仍按原文搜索，但原因必须让用户看到
+                    addChatMessage(`⚠️ ${event.content}`);
+                    showNotification(event.content, 'warning');
+                    break;
+
                 case 'chat':
                     // 对话模式 - 直接显示回复
                     removeLoadingMessage();
@@ -2701,7 +2703,7 @@
 
                     // 更新主音效列表
                     if (event.results && event.results.length > 0) {
-                        displayAiSearchResults(event.results);
+                        displayAiSearchResults(event.results, { fallback: event.fallback === true });
                     } else {
                         addChatMessage('没有找到匹配的音效。试试其他描述？');
                     }
@@ -2709,11 +2711,12 @@
 
                 case 'error':
                     addChatMessage(`错误: ${event.content}`);
+                    showNotification(event.content, 'error');
                     break;
             }
         }
 
-        function displayAiSearchResults(results) {
+        function displayAiSearchResults(results, { fallback = false } = {}) {
             // 将 AI 搜索结果转换为 soundData 格式，用和普通列表相同的行显示（高亮、键盘切换一致）
             allSearchResults = results.map((r, index) => ({
                 id: r.file_id || r.id || r.metadata?.file_id || `ai-result-${index}`,
@@ -2738,7 +2741,11 @@
             document.getElementById('soundList').scrollTop = 0;
 
             // 显示通知
-            showNotification(`AI 搜索完成，找到 ${results.length} 个相关音效`, 'success');
+            if (fallback) {
+                showNotification(`模型未参与，按原文搜索到 ${results.length} 个音效`, 'warning');
+            } else {
+                showNotification(`AI 搜索完成，找到 ${results.length} 个相关音效`, 'success');
+            }
         }
 
         // ==================== SETTINGS MODAL ====================

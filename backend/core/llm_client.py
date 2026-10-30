@@ -130,7 +130,17 @@ class LLMClient:
         return f"{self.base_url}/{endpoint.lstrip('/')}"
 
     @staticmethod
-    def _response_error(response: httpx.Response) -> LLMError:
+    def _body_excerpt(response: httpx.Response, secret: str = "") -> str:
+        try:
+            text = response.text
+        except httpx.ResponseNotRead:
+            return "<响应体未读取>"
+        if secret:
+            text = text.replace(secret, "***")
+        return " ".join(text.split())[:300]
+
+    @staticmethod
+    def _response_error(response: httpx.Response, secret: str = "") -> LLMError:
         status = response.status_code
         if status in {401, 403}:
             code, message, retryable = "authentication_failed", "LLM API 认证失败", False
@@ -139,8 +149,15 @@ class LLMClient:
         elif status >= 500:
             code, message, retryable = "provider_unavailable", "LLM 服务暂时不可用", True
         else:
-            code, message, retryable = "provider_rejected", f"LLM 请求失败 (HTTP {status})", False
-        return LLMError(code, message, retryable=retryable, status_code=status)
+            code, message, retryable = "provider_rejected", "LLM 请求失败", False
+        # Provider bodies stay out of API/IPC payloads because they may echo
+        # request details; log a masked excerpt so the failure stays diagnosable.
+        logger.warning(
+            "LLM 服务返回 HTTP %s: %s", status, LLMClient._body_excerpt(response, secret)
+        )
+        return LLMError(
+            code, f"{message} (HTTP {status})", retryable=retryable, status_code=status
+        )
 
     @staticmethod
     def _transport_error(exc: Exception) -> LLMError:
@@ -169,7 +186,7 @@ class LLMClient:
                     timeout=timeout,
                 )
                 if response.is_error:
-                    raise self._response_error(response)
+                    raise self._response_error(response, self.api_key)
                 data = response.json()
                 if not isinstance(data, dict):
                     raise LLMError("invalid_response", "LLM 返回了无效 JSON 结构")
@@ -259,7 +276,8 @@ class LLMClient:
                     timeout=120.0,
                 ) as response:
                     if response.is_error:
-                        raise self._response_error(response)
+                        await response.aread()
+                        raise self._response_error(response, self.api_key)
                     # httpx buffers arbitrary TCP chunks into complete lines,
                     # so SSE JSON split across network chunks is preserved.
                     async for raw_line in response.aiter_lines():
@@ -356,7 +374,7 @@ class LLMClient:
                     timeout=30.0,
                 )
                 if response.is_error:
-                    raise self._response_error(response)
+                    raise self._response_error(response, api_key)
                 items = response.json().get("data", [])
                 ordered = sorted(items, key=lambda item: int(item.get("index", 0)))
                 vectors = [item["embedding"] for item in ordered]

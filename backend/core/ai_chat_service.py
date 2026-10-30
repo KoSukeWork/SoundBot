@@ -148,18 +148,26 @@ class AIChatService:
         bound_project = self._resolve_project(project_id)
         try:
             yield {"type": "thinking", "content": "..."}
+            fallback_reason = None
             if self.llm_client.is_available:
                 try:
                     intent = await self._ask_llm(message, conversation_history)
                 except Exception as exc:
                     logger.warning("意图模型不可用，直接搜索原始查询: %s", exc)
-                    intent = IntentResult(
-                        type="search", keywords=[message], response=f"正在搜索: {message}"
-                    )
+                    fallback_reason = f"模型调用失败：{exc}"
             else:
+                fallback_reason = "没有可用的对话模型配置"
+            if fallback_reason:
+                # The raw-text search still runs, but never as if the model had
+                # understood the request.
                 intent = IntentResult(
                     type="search", keywords=[message], response=f"正在搜索: {message}"
                 )
+                yield {
+                    "type": "warning",
+                    "code": "llm_fallback",
+                    "content": f"{fallback_reason}。下面是按原文「{message}」直接搜索的结果，可能不准。",
+                }
 
             if intent.type == "chat":
                 response = await self._generate_chat_response(message, conversation_history)
@@ -188,11 +196,13 @@ class AIChatService:
                 # exposing the public field consumed by the renderer.
                 item["file_id"] = metadata.get("file_id")
                 serialized.append(item)
+            summary = self._make_summary(message, results)
             yield {
                 "type": "results",
                 "results": serialized,
                 "count": len(results),
-                "summary": self._make_summary(message, results),
+                "summary": f"（按原文直接搜索）{summary}" if fallback_reason else summary,
+                "fallback": bool(fallback_reason),
                 "project_id": bound_project,
             }
         except Exception as exc:
@@ -246,12 +256,12 @@ class AIChatService:
                 raise RuntimeError(chunk.get("message", chunk.get("content", "LLM 错误")))
         try:
             result = IntentResult.model_validate(self._extract_json(full_response))
-            if result.type == "search" and not result.keywords:
-                result.keywords = [message]
-            return result
         except (ValidationError, ValueError) as exc:
-            logger.warning("意图 JSON 无效，回退原始查询: %s", exc)
-            return IntentResult(type="search", keywords=[message], response=f"搜索: {message}")
+            excerpt = " ".join(full_response.split())[:200]
+            raise RuntimeError(f"模型返回的内容不是要求的 JSON：{excerpt or '（空）'}") from exc
+        if result.type == "search" and not result.keywords:
+            result.keywords = [message]
+        return result
 
     async def _search(
         self,
@@ -261,25 +271,23 @@ class AIChatService:
         *,
         project_id: Optional[str] = None,
     ) -> List[SearchResult]:
-        try:
-            searcher = self.get_searcher(project_id)
-            results, stats = await searcher.search_async(
-                query=query,
-                top_k=top_k,
-                min_similarity=threshold,
-                use_cache=True,
-            )
-            logger.info(
-                "AI 搜索 '%s': project=%s count=%s cache=%s",
-                query,
-                self._resolve_project(project_id),
-                len(results),
-                stats.get("cache_hit", False),
-            )
-            return results
-        except Exception as exc:
-            logger.error("搜索失败: %s", exc)
-            return []
+        # Errors propagate to chat(), which reports them; an empty list here
+        # would read as "nothing found".
+        searcher = self.get_searcher(project_id)
+        results, stats = await searcher.search_async(
+            query=query,
+            top_k=top_k,
+            min_similarity=threshold,
+            use_cache=True,
+        )
+        logger.info(
+            "AI 搜索 '%s': project=%s count=%s cache=%s",
+            query,
+            self._resolve_project(project_id),
+            len(results),
+            stats.get("cache_hit", False),
+        )
+        return results
 
     def _make_summary(self, query: str, results: List[SearchResult]) -> str:
         count = len(results)
@@ -304,7 +312,7 @@ class AIChatService:
             if chunk["type"] == "content":
                 full_response += chunk["content"]
             elif chunk["type"] == "error":
-                return "抱歉，我现在无法连接到 AI 服务。你仍然可以直接输入关键词搜索音效。"
+                raise RuntimeError(f"模型调用失败：{chunk.get('message', chunk.get('content', 'LLM 错误'))}")
         return full_response.strip() or "你好！需要找什么音效吗？"
 
 

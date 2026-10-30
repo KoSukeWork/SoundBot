@@ -19,6 +19,19 @@ class UnavailableLLM:
     is_available = False
 
 
+class ScriptedLLM:
+    """Replays fixed chat chunks, like a provider that answers or fails."""
+
+    is_available = True
+
+    def __init__(self, *chunks):
+        self.chunks = chunks
+
+    async def chat(self, **_kwargs):
+        for chunk in self.chunks:
+            yield chunk
+
+
 class AIChatServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_current_user_message_is_not_duplicated(self):
         messages = AIChatService._prepare_messages(
@@ -72,8 +85,63 @@ class AIChatServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         searching = next(chunk for chunk in chunks if chunk["type"] == "searching")
         results = next(chunk for chunk in chunks if chunk["type"] == "results")
+        warning = next(chunk for chunk in chunks if chunk["type"] == "warning")
         self.assertEqual(searching["query"], "暴雨")
         self.assertEqual(results["project_id"], "project-a")
+        self.assertIn("没有可用的对话模型配置", warning["content"])
+        self.assertTrue(results["fallback"])
+
+    async def test_failed_model_call_is_reported_before_raw_search(self):
+        service = AIChatService(project_id="project-a")
+        service._llm_client = ScriptedLLM(
+            {"type": "error", "message": "LLM 服务暂时不可用 (HTTP 503)"}
+        )
+        with mock.patch.object(service, "_search", return_value=[]) as search:
+            chunks = [chunk async for chunk in service.chat("手雷爆炸", top_k=5)]
+        search.assert_awaited_once_with("手雷爆炸", 5, 0.1, project_id="project-a")
+        types = [chunk["type"] for chunk in chunks]
+        self.assertLess(types.index("warning"), types.index("results"))
+        warning = chunks[types.index("warning")]
+        self.assertIn("模型调用失败", warning["content"])
+        self.assertIn("HTTP 503", warning["content"])
+        results = chunks[types.index("results")]
+        self.assertTrue(results["fallback"])
+        self.assertTrue(results["summary"].startswith("（按原文直接搜索）"))
+
+    async def test_unparseable_model_reply_is_reported_with_an_excerpt(self):
+        service = AIChatService(project_id="project-a")
+        service._llm_client = ScriptedLLM(
+            {"type": "content", "content": "Sure! Grenade explosions are loud."}
+        )
+        with mock.patch.object(service, "_search", return_value=[]):
+            chunks = [chunk async for chunk in service.chat("手雷爆炸")]
+        warning = next(chunk for chunk in chunks if chunk["type"] == "warning")
+        self.assertIn("不是要求的 JSON", warning["content"])
+        self.assertIn("Grenade explosions are loud", warning["content"])
+
+    async def test_understood_request_searches_model_keywords_without_warning(self):
+        service = AIChatService(project_id="project-a")
+        service._llm_client = ScriptedLLM(
+            {"type": "content", "content": '{"type":"search","keywords":["grenade explosion"]}'}
+        )
+        with mock.patch.object(service, "_search", return_value=[]) as search:
+            chunks = [chunk async for chunk in service.chat("手雷爆炸", top_k=5)]
+        search.assert_awaited_once_with("grenade explosion", 5, 0.1, project_id="project-a")
+        self.assertNotIn("warning", [chunk["type"] for chunk in chunks])
+        results = next(chunk for chunk in chunks if chunk["type"] == "results")
+        self.assertFalse(results["fallback"])
+
+    async def test_search_failure_is_an_error_not_an_empty_result(self):
+        service = AIChatService(project_id="project-a")
+        service._llm_client = UnavailableLLM()
+        searcher = mock.Mock()
+        searcher.search_async = mock.AsyncMock(side_effect=RuntimeError("index offline"))
+        with mock.patch.object(service, "get_searcher", return_value=searcher):
+            chunks = [chunk async for chunk in service.chat("rain")]
+        types = [chunk["type"] for chunk in chunks]
+        self.assertNotIn("results", types)
+        error = next(chunk for chunk in chunks if chunk["type"] == "error")
+        self.assertIn("index offline", error["content"])
 
     async def test_results_expose_stable_file_id_for_transcoded_playback(self):
         service = AIChatService(project_id="project-a")
