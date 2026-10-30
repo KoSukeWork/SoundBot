@@ -479,18 +479,21 @@ class LLMConfigManager:
             try:
                 with open(self._config_path, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
-                    # 合并默认配置，确保所有字段都存在
-                    merged = self._normalize_provider_selection(
-                        self._merge_config(DEFAULT_CONFIG, loaded)
+                # 合并默认配置，确保所有字段都存在
+                merged = self._normalize_provider_selection(
+                    self._merge_config(DEFAULT_CONFIG, loaded)
+                )
+                if _contains_plaintext_secret(loaded):
+                    logger.warning(
+                        "检测到旧版明文 AI 密钥；已仅加载到当前进程内存并从 JSON 配置移除"
                     )
-                    if _contains_plaintext_secret(loaded):
-                        logger.warning(
-                            "检测到旧版明文 AI 密钥；已仅加载到当前进程内存并从 JSON 配置移除"
-                        )
-                    # Always rewrite through the redacting serializer.  This
-                    # also removes empty legacy api_key placeholders.
-                    self._save_config(merged)
-                    return merged
+                # Always rewrite through the redacting serializer.  This
+                # also removes empty legacy api_key placeholders.  It must run
+                # after the read handle closes: Windows refuses to replace an
+                # open file, and that failure used to reset the user's config
+                # to defaults on every start.
+                self._save_config(merged)
+                return merged
             except Exception as e:
                 logger.warning(f"加载配置文件失败: {e}，使用默认配置")
 

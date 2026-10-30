@@ -51,6 +51,36 @@ class LLMConfigTests(unittest.TestCase):
             self.assertEqual(configured["legacy_provider"], "anthropic")
             self.assertEqual(configured["anthropic"]["api_key"], "legacy-secret")
 
+    def test_saved_provider_survives_a_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "ai_config.json").write_text(
+                json.dumps(
+                    {
+                        "llm": {
+                            "provider": "custom",
+                            "custom": {
+                                "base_url": "https://relay.test/v1",
+                                "model": "relay-model",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            LLMConfigManager._instance = None
+            with mock.patch.object(
+                manager_module.config, "get_user_data_dir", return_value=root
+            ):
+                manager = LLMConfigManager()
+
+            configured = manager.get_llm_config()
+            self.assertEqual(configured["provider"], "custom")
+            self.assertEqual(configured["custom"]["base_url"], "https://relay.test/v1")
+            on_disk = json.loads((root / "ai_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["llm"]["provider"], "custom")
+            self.assertEqual(on_disk["llm"]["custom"]["model"], "relay-model")
+
     def test_public_config_returns_presence_not_secret(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
