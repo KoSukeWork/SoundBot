@@ -79,6 +79,7 @@ async function main() {
   assert(indexHtml.includes('selectAndPlaySound(sound);'), 'list playback is not an explicit select-and-play action');
   assert(indexHtml.includes("moveCurrentSound(e.key === 'ArrowDown' ? 1 : -1"), 'arrow keys do not move through the list');
   assert(indexHtml.includes("localStorage.setItem('soundbot_autoplay'"), 'autoplay preference is not remembered');
+  assert(indexHtml.includes('seekCurrentSound(0);'), 'Enter does not return the playhead to the start');
   assert(indexHtml.includes('if (stale()) return;'), 'superseded playback loads are not discarded');
   assert(indexHtml.includes('rendererSearch.buildPayload({'), 'search payload module is not wired');
   assert(indexHtml.includes("rendererApi.post('/api/v1/search', searchRequest)"), 'project-scoped search request is not wired');

@@ -5675,7 +5675,20 @@
                 return element.tagName === 'INPUT' && !['checkbox', 'radio', 'button', 'range'].includes(element.type);
             }
 
-            // 键盘：空格播放/暂停，↑↓ 切换条目，Home/End 第一条/最后一条，Enter 从头播放
+            // 移动播放头（秒）：播放中继续播放，暂停时只移动位置
+            function seekCurrentSound(seconds) {
+                if (!currentSound || !audioPlayer?.duration) return;
+                const time = Math.max(0, Math.min(audioPlayer.duration, seconds));
+                audioPlayer.currentTime = time;
+                // 跳到选区之后就播放到文件结尾，不在选区终点停下
+                if (selectionEnd !== null && time >= selectionEnd / 1000) playbackStartedInSelection = false;
+                lastStoppedAtSelectionEnd = false;
+                playbackProgress = Math.round(time * 1000);
+                updatePlaybackUI();
+                drawMainWaveform();
+            }
+
+            // 键盘：空格播放/暂停，↑↓ 切换条目，←→ 快退/快进，Home/End 第一条/最后一条，Enter 回到开头
             document.addEventListener('keydown', (e) => {
                 if (e.ctrlKey || e.metaKey || e.altKey) return;
                 if (document.querySelector('.fixed.inset-0[id$="Modal"]:not(.hidden)')) return;
@@ -5695,11 +5708,19 @@
                     goToSound(lastRenderedSounds[e.key === 'Home' ? 0 : lastRenderedSounds.length - 1]);
                     return;
                 }
+                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                    e.preventDefault();
+                    // 每次移动全长的 5%：短音效步子小，长音频步子大
+                    if (audioPlayer?.duration) {
+                        const step = audioPlayer.duration * 0.05;
+                        seekCurrentSound(audioPlayer.currentTime + (e.key === 'ArrowRight' ? step : -step));
+                    }
+                    return;
+                }
                 if (e.key === 'Enter') {
                     if (!currentSound || e.target.closest?.('button, a')) return;
                     e.preventDefault();
-                    clearTimeout(navigationPlayTimer);
-                    playSound(currentSound, { forcePlay: true });
+                    seekCurrentSound(0);
                     return;
                 }
 
