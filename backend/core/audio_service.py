@@ -149,6 +149,37 @@ class WaveformResult:
         }
 
 
+class AdaptiveResampler:
+    """An ``AudioResampler`` that follows input format changes mid-stream.
+
+    Joined MP3s and corrupt headers can change the sample rate or layout
+    partway through a file, which a plain ``AudioResampler`` rejects.
+    """
+
+    def __init__(self, **options: Any) -> None:
+        self._options = options
+        self._resampler = None
+        self._input = None
+
+    def resample(self, frame: Any) -> list[Any]:
+        if frame is None:
+            return self._flush()
+        output = []
+        key = (frame.format.name, frame.layout.name, frame.sample_rate)
+        if key != self._input:
+            output.extend(self._flush())
+            self._resampler = _av.AudioResampler(**self._options)
+            self._input = key
+        output.extend(AudioService._iter_av_frames(self._resampler.resample(frame)))
+        return output
+
+    def _flush(self) -> list[Any]:
+        if self._resampler is None:
+            return []
+        resampler, self._resampler, self._input = self._resampler, None, None
+        return list(AudioService._iter_av_frames(resampler.resample(None)))
+
+
 class AudioService:
     """Thread-safe facade around stateless decoders and a bounded WAV cache."""
 
@@ -317,7 +348,7 @@ class AudioService:
                 )
                 if sample_rate < 1:
                     raise ValueError("audio stream has no sample rate")
-                resampler = _av.AudioResampler(
+                resampler = AdaptiveResampler(
                     format="fltp", layout="mono", rate=sample_rate
                 )
 
@@ -555,7 +586,7 @@ class AudioService:
             if not layout:
                 channel_count = int(getattr(stream.codec_context, 'channels', 0) or 1)
                 layout = 'mono' if channel_count == 1 else 'stereo'
-            resampler = _av.AudioResampler(format='fltp', layout=layout, rate=output_rate)
+            resampler = AdaptiveResampler(format='fltp', layout=layout, rate=output_rate)
 
             for frame in AudioService._decode_audio_frames(container, stream):
                 converted = resampler.resample(frame)
@@ -590,15 +621,18 @@ class AudioService:
 
         Library MP3s often carry a few corrupt frames. Players conceal them,
         but ``container.decode`` raises on the first one and loses the whole
-        file. A corrupt header can also decode as a stray frame with another
-        rate or layout, which the caller's resampler would reject, so frames
-        that differ from the first are dropped too. When rejected packets are
-        not a clear minority the codec's own error still propagates, so
-        garbage is never indexed as audio.
+        file. When rejected packets are not a clear minority the codec's own
+        error still propagates, so garbage is never indexed as audio.
         """
+        context = stream.codec_context
+        channels = context.layout.channels
+        # Some WMA streams declare a channel count without an order. A second
+        # resampler fed the same frame then fails with EINVAL, so give the
+        # decoder the standard layout before it opens, as the ffmpeg CLI does.
+        if len(channels) in (1, 2) and all(channel.name == 'NONE' for channel in channels):
+            context.layout = 'mono' if len(channels) == 1 else 'stereo'
         decoded = rejected = 0
         first_error = None
-        shape = None
         for packet in container.demux(stream):
             try:
                 frames = packet.decode()
@@ -607,18 +641,12 @@ class AudioService:
                 if first_error is None:
                     first_error = exc
                 continue
-            for frame in frames:
-                key = (frame.sample_rate, frame.layout.name, frame.format.name)
-                if shape is None:
-                    shape = key
-                elif key != shape:
-                    rejected += 1
-                    continue
+            if packet.size:
                 decoded += 1
-                yield frame
+            yield from frames
         if rejected:
             if rejected >= decoded:
-                raise first_error or ValueError('decoded frames do not share one audio format')
+                raise first_error
             logger.info(
                 'Skipped %d corrupt packet(s) of %d in %s',
                 rejected, decoded + rejected, getattr(container, 'name', ''),

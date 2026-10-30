@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from core.audio_service import AudioService, WaveformResult, _av
+from core.audio_service import AdaptiveResampler, AudioService, WaveformResult, _av
 from config import WAVEFORM_PEAK_COUNT
 
 _worker_cancel = None
@@ -186,8 +186,8 @@ def prepare_index_audio(service, path, sample_rate, *, waveform=True, cancel=Non
                 native_rate = int(stream.codec_context.sample_rate or stream.rate or 0)
                 if native_rate < 1:
                     raise ValueError('audio stream has no sample rate')
-                wave_resampler = _av.AudioResampler(format='fltp', layout='mono', rate=native_rate) if waveform else None
-                clap_resampler = _av.AudioResampler(format='fltp', layout='mono', rate=sample_rate)
+                wave_resampler = AdaptiveResampler(format='fltp', layout='mono', rate=native_rate) if waveform else None
+                clap_resampler = AdaptiveResampler(format='fltp', layout='mono', rate=sample_rate)
                 next_space_check = 0
 
                 def check_spool_space():

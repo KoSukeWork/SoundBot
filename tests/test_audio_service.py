@@ -222,32 +222,80 @@ class AudioServiceTests(unittest.TestCase):
             prepared.close()
 
     @unittest.skipUnless(HAS_MP3_ENCODER, "PyAV with libmp3lame is not installed")
-    def test_stray_frame_with_another_rate_is_skipped(self) -> None:
+    def test_sample_rate_changes_mid_stream_are_resampled(self) -> None:
         from core.index_audio import prepare_index_audio
 
-        data, frames = encode_test_mp3()
-        other, other_frames = encode_test_mp3(seconds=0.5, rate=48000)
-        position = frames[len(frames) // 2][0]
-        stray_position, stray_size = other_frames[len(other_frames) // 2]
-        spliced = self.root / 'stray-48k-frame.mp3'
-        spliced.write_bytes(bytes(
-            data[:position] + other[stray_position:stray_position + stray_size] + data[position:]))
-        rates = set()
-        with audio_service_module._av.open(str(spliced)) as container:
-            for frame in container.decode(container.streams.audio[0]):
-                rates.add(frame.sample_rate)
-        self.assertEqual(rates, {44100, 48000})
+        # Joined clips at different rates, and a corrupt header decoding as a
+        # stray frame at another rate, both used to fail the whole file.
+        short, _ = encode_test_mp3(seconds=1.0, rate=32000)
+        long, long_frames = encode_test_mp3(seconds=2.0)
+        stray, stray_frames = encode_test_mp3(seconds=0.5, rate=48000)
+        position = long_frames[len(long_frames) // 2][0]
+        stray_position, stray_size = stray_frames[len(stray_frames) // 2]
+        joined = self.root / 'joined-32k-44k.mp3'
+        joined.write_bytes(bytes(
+            short + long[:position] + stray[stray_position:stray_position + stray_size]
+            + long[position:]))
+        with self.assertRaisesRegex(ValueError, 'does not match AudioResampler'):
+            with audio_service_module._av.open(str(joined)) as container:
+                resampler = audio_service_module._av.AudioResampler(
+                    format='fltp', layout='mono', rate=48000)
+                for frame in container.decode(container.streams.audio[0]):
+                    resampler.resample(frame)
 
         service = AudioService(self.cache)
-        decoded = service.decode(spliced, mono=True)
-        self.assertEqual(decoded.sample_rate, 44100)
-        self.assertGreater(decoded.duration, 1.9)
-        self.assertGreater(service.waveform(spliced).duration, 1.9)
-        prepared = prepare_index_audio(service, spliced, 48000)
+        decoded = service.decode(joined, target_sample_rate=48000, mono=True)
+        self.assertGreater(decoded.duration, 2.9)
+        self.assertGreater(service.waveform(joined).duration, 2.9)
+        prepared = prepare_index_audio(service, joined, 48000)
         try:
-            self.assertGreater(prepared.waveform.duration, 1.9)
+            self.assertGreater(prepared.waveform.duration, 2.9)
+            self.assertGreater(prepared.path.stat().st_size, 2.9 * 48000 * 4)
         finally:
             prepared.close()
+
+    @unittest.skipUnless(
+        audio_service_module._av is not None
+        and 'wmav2' in audio_service_module._av.codecs_available,
+        "PyAV with the WMA encoder is not installed",
+    )
+    def test_unordered_channel_layout_survives_two_resamplers(self) -> None:
+        from core.index_audio import prepare_index_audio
+
+        av = audio_service_module._av
+        source = self.root / 'unordered-mono.wma'
+        with av.open(str(source), 'w', format='asf') as output:
+            stream = output.add_stream('wmav2', rate=22050)
+            stream.layout = 'mono'
+            stream.bit_rate = 32000
+            pcm = (np.sin(2 * np.pi * 440 * np.arange(22050) / 22050) * 0.5).astype(np.float32)
+            for start in range(0, len(pcm), 2048):
+                frame = av.AudioFrame.from_ndarray(
+                    pcm[start:start + 2048].reshape(1, -1), format='fltp', layout='mono')
+                frame.sample_rate = 22050
+                for packet in stream.encode(frame):
+                    output.mux(packet)
+            for packet in stream.encode(None):
+                output.mux(packet)
+        # Prove the fixture decodes without a channel order and reproduces the
+        # former EINVAL when the waveform and CLAP resamplers share a frame.
+        with av.open(str(source)) as container:
+            stream = container.streams.audio[0]
+            self.assertEqual([c.name for c in stream.codec_context.layout.channels], ['NONE'])
+            wave = av.AudioResampler(format='fltp', layout='mono', rate=22050)
+            clap = av.AudioResampler(format='fltp', layout='mono', rate=48000)
+            with self.assertRaises(av.ArgumentError):
+                for frame in container.decode(stream):
+                    wave.resample(frame)
+                    clap.resample(frame)
+
+        service = AudioService(self.cache)
+        prepared = prepare_index_audio(service, source, 48000)
+        try:
+            self.assertGreater(prepared.waveform.duration, 0.9)
+        finally:
+            prepared.close()
+        self.assertEqual(service.decode(source, mono=False).channels, 1)
 
     @unittest.skipUnless(HAS_MP3_ENCODER, "PyAV with libmp3lame is not installed")
     def test_mostly_corrupt_mp3_still_fails(self) -> None:
