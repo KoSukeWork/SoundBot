@@ -219,7 +219,7 @@ def prepare_index_audio(service, path, sample_rate, *, waveform=True, cancel=Non
                         size += values.size
                     return size
 
-                for frame in container.decode(stream):
+                for frame in AudioService._decode_audio_frames(container, stream):
                     check_cancel(cancel)
                     if wave_resampler is not None:
                         count += write(wave_resampler, frame, wave_sink)

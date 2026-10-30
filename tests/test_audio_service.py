@@ -38,6 +38,46 @@ def write_test_wav(path: Path, *, frequency: float = 440.0, frames: int = 800) -
         output.writeframes(payload)
 
 
+def encode_test_mp3(
+    seconds: float = 2.0, rate: int = 44100
+) -> tuple[bytearray, list[tuple[int, int]]]:
+    """Return a mono 440 Hz MP3 and the (offset, size) of each audio frame."""
+    av = audio_service_module._av
+    buffer = io.BytesIO()
+    with av.open(buffer, 'w', format='mp3') as output:
+        stream = output.add_stream('libmp3lame', rate=rate)
+        stream.layout = 'mono'
+        sample_format = stream.codec_context.format.name
+        times = np.arange(int(rate * seconds)) / rate
+        pcm = (np.sin(2 * np.pi * 440 * times) * 0.5 * (2**31 - 1)).astype(np.int32)
+        for start in range(0, len(pcm), 1152):
+            frame = av.AudioFrame.from_ndarray(
+                pcm[start:start + 1152].reshape(1, -1), format=sample_format, layout='mono')
+            frame.sample_rate = rate
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode(None):
+            output.mux(packet)
+    data = bytearray(buffer.getvalue())
+    with av.open(io.BytesIO(bytes(data))) as container:
+        frames = [(packet.pos, packet.size)
+                  for packet in container.demux(container.streams.audio[0]) if packet.size]
+    return data, frames
+
+
+def corrupt_mp3_frame(data: bytearray, frame: tuple[int, int]) -> None:
+    # Garble the side information after the 4-byte header so the demuxer still
+    # finds the frame but the decoder rejects it, as in damaged library files.
+    position, _size = frame
+    data[position + 4:position + 36] = b'\xff' * 32
+
+
+HAS_MP3_ENCODER = (
+    audio_service_module._av is not None
+    and 'libmp3lame' in audio_service_module._av.codecs_available
+)
+
+
 class AudioServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -154,6 +194,80 @@ class AudioServiceTests(unittest.TestCase):
                         embedder.audio_to_embedding(str(source))
                 self.assertIsInstance(caught.exception.__cause__, AudioServiceError)
                 embedder._process_audio_segment.assert_not_called()
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "PyAV with libmp3lame is not installed")
+    def test_isolated_corrupt_mp3_frames_are_skipped_on_every_decode_path(self) -> None:
+        from core.index_audio import prepare_index_audio
+
+        data, frames = encode_test_mp3()
+        corrupt_mp3_frame(data, frames[len(frames) // 2])
+        damaged = self.root / 'one-bad-frame.mp3'
+        damaged.write_bytes(bytes(data))
+        # Prove the fixture reproduces the former whole-file failure.
+        with self.assertRaises(audio_service_module._av.InvalidDataError):
+            with audio_service_module._av.open(str(damaged)) as container:
+                for _frame in container.decode(container.streams.audio[0]):
+                    pass
+
+        service = AudioService(self.cache)
+        decoded = service.decode(damaged, mono=True)
+        self.assertGreater(decoded.duration, 1.9)
+        self.assertGreater(float(np.max(np.abs(decoded.samples))), 0.3)
+        self.assertGreater(service.waveform(damaged).duration, 1.9)
+        prepared = prepare_index_audio(service, damaged, 48000)
+        try:
+            self.assertGreater(prepared.waveform.duration, 1.9)
+            self.assertGreater(prepared.path.stat().st_size, 1.9 * 48000 * 4)
+        finally:
+            prepared.close()
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "PyAV with libmp3lame is not installed")
+    def test_stray_frame_with_another_rate_is_skipped(self) -> None:
+        from core.index_audio import prepare_index_audio
+
+        data, frames = encode_test_mp3()
+        other, other_frames = encode_test_mp3(seconds=0.5, rate=48000)
+        position = frames[len(frames) // 2][0]
+        stray_position, stray_size = other_frames[len(other_frames) // 2]
+        spliced = self.root / 'stray-48k-frame.mp3'
+        spliced.write_bytes(bytes(
+            data[:position] + other[stray_position:stray_position + stray_size] + data[position:]))
+        rates = set()
+        with audio_service_module._av.open(str(spliced)) as container:
+            for frame in container.decode(container.streams.audio[0]):
+                rates.add(frame.sample_rate)
+        self.assertEqual(rates, {44100, 48000})
+
+        service = AudioService(self.cache)
+        decoded = service.decode(spliced, mono=True)
+        self.assertEqual(decoded.sample_rate, 44100)
+        self.assertGreater(decoded.duration, 1.9)
+        self.assertGreater(service.waveform(spliced).duration, 1.9)
+        prepared = prepare_index_audio(service, spliced, 48000)
+        try:
+            self.assertGreater(prepared.waveform.duration, 1.9)
+        finally:
+            prepared.close()
+
+    @unittest.skipUnless(HAS_MP3_ENCODER, "PyAV with libmp3lame is not installed")
+    def test_mostly_corrupt_mp3_still_fails(self) -> None:
+        from core.index_audio import prepare_index_audio
+
+        data, frames = encode_test_mp3()
+        for frame in frames[2:]:
+            corrupt_mp3_frame(data, frame)
+        damaged = self.root / 'mostly-bad.mp3'
+        damaged.write_bytes(bytes(data))
+
+        service = AudioService(self.cache)
+        with self.assertRaises(AudioServiceError) as caught:
+            service.decode(damaged, mono=True)
+        self.assertEqual(caught.exception.code, 'audio_decode_failed')
+        with self.assertRaises(AudioServiceError) as caught:
+            service.waveform(damaged)
+        self.assertEqual(caught.exception.code, 'waveform_decode_failed')
+        with self.assertRaises(audio_service_module._av.InvalidDataError):
+            prepare_index_audio(service, damaged, 48000)
 
     def test_pyav_decoder_is_preferred_and_fallback_is_not_called(self) -> None:
         service = AudioService(self.cache)

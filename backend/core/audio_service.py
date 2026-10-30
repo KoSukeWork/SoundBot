@@ -333,7 +333,7 @@ class AudioService:
                         sink.write(values.tobytes())
                         frame_count += int(values.size)
 
-                for frame in container.decode(stream):
+                for frame in self._decode_audio_frames(container, stream):
                     if cancel is not None and cancel.is_set():
                         from core.index_audio import IndexWorkCancelled
                         raise IndexWorkCancelled()
@@ -557,7 +557,7 @@ class AudioService:
                 layout = 'mono' if channel_count == 1 else 'stereo'
             resampler = _av.AudioResampler(format='fltp', layout=layout, rate=output_rate)
 
-            for frame in container.decode(stream):
+            for frame in AudioService._decode_audio_frames(container, stream):
                 converted = resampler.resample(frame)
                 for output_frame in AudioService._iter_av_frames(converted):
                     array = np.asarray(output_frame.to_ndarray(), dtype=np.float32)
@@ -583,6 +583,46 @@ class AudioService:
             channels=channels,
             duration=float(samples.shape[0] / output_rate),
         )
+
+    @staticmethod
+    def _decode_audio_frames(container, stream) -> Iterable[Any]:
+        """Decode ``stream``, skipping packets the codec rejects as invalid.
+
+        Library MP3s often carry a few corrupt frames. Players conceal them,
+        but ``container.decode`` raises on the first one and loses the whole
+        file. A corrupt header can also decode as a stray frame with another
+        rate or layout, which the caller's resampler would reject, so frames
+        that differ from the first are dropped too. When rejected packets are
+        not a clear minority the codec's own error still propagates, so
+        garbage is never indexed as audio.
+        """
+        decoded = rejected = 0
+        first_error = None
+        shape = None
+        for packet in container.demux(stream):
+            try:
+                frames = packet.decode()
+            except _av.InvalidDataError as exc:
+                rejected += 1
+                if first_error is None:
+                    first_error = exc
+                continue
+            for frame in frames:
+                key = (frame.sample_rate, frame.layout.name, frame.format.name)
+                if shape is None:
+                    shape = key
+                elif key != shape:
+                    rejected += 1
+                    continue
+                decoded += 1
+                yield frame
+        if rejected:
+            if rejected >= decoded:
+                raise first_error or ValueError('decoded frames do not share one audio format')
+            logger.info(
+                'Skipped %d corrupt packet(s) of %d in %s',
+                rejected, decoded + rejected, getattr(container, 'name', ''),
+            )
 
     @staticmethod
     def _iter_av_frames(value: Any) -> Iterable[Any]:
