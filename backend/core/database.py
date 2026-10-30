@@ -48,6 +48,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
+from core.folder_tree import parent_folder
+
 logger = None  # 延迟初始化
 
 SCHEMA_VERSION = 3
@@ -1395,30 +1397,90 @@ class DatabaseManager:
             rows = cursor.execute(sql, params).fetchall()
         has_more = len(rows) > limit
         rows = rows[:limit]
-        items = []
-        for row in rows:
-            try:
-                tags = json.loads(row["tags"] or "[]")
-            except (TypeError, ValueError):
-                tags = []
-            items.append({
-                "id": row["file_uuid"],
-                "path": row["path"],
-                "filename": row["filename"],
-                "duration": row["duration"],
-                "sample_rate": row["sample_rate"],
-                "channels": row["channels"],
-                "file_size": row["file_size"],
-                "format": Path(row["path"]).suffix.lower().lstrip("."),
-                "tags": tags,
-                "source_fingerprint": row["source_fingerprint"],
-                "waveform_version": row["waveform_version"],
-                "waveform_state": row["waveform_state"] or "pending",
-                "audio_index_state": row["audio_index_state"] or "pending",
-                "text_index_state": row["text_index_state"] or "pending",
-            })
+        items = [self._file_page_item(row) for row in rows]
         next_cursor = rows[-1]["id"] if has_more and rows else None
         return items, next_cursor
+
+    def get_folder_files_page(
+        self,
+        project_id: str,
+        folder_path: str,
+        limit: int = 200,
+        after: Optional[str] = None,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Return a metadata-only page of files under a folder, in path order.
+
+        Subfolders are included. A range on the (project_id, canonical_path)
+        index keeps every page a seek however many files the folder holds; the
+        cursor is the last canonical path returned.
+        """
+        limit = max(1, min(int(limit), 500))
+        folder_key = canonicalize_path(folder_path)
+        if not folder_key:
+            return [], None
+        prefix = folder_key if folder_key.endswith("/") else folder_key + "/"
+        # Canonical keys always use "/", and "0" is the next code point.
+        upper = prefix[:-1] + "0"
+        lower = after if after is not None and after > prefix else None
+        states = ", ".join(
+            f"(SELECT a.state FROM file_artifacts a WHERE a.project_id=f.project_id"
+            f" AND a.file_uuid=f.file_uuid AND a.kind='{kind}') AS {alias}"
+            for kind, alias in (("waveform", "waveform_state"),
+                                ("audio_vector", "audio_index_state"),
+                                ("text_vector", "text_index_state"))
+        )
+        sql = f"""
+            SELECT f.id, f.file_uuid, f.path, f.filename, f.duration,
+                   f.sample_rate, f.channels, f.file_size, f.tags,
+                   f.source_fingerprint, f.waveform_version, f.canonical_path, {states}
+            FROM files f
+            WHERE f.project_id=? AND f.canonical_path >= ? AND f.canonical_path < ?
+        """
+        params: List[Any] = [project_id, prefix, upper]
+        if lower is not None:
+            sql += " AND f.canonical_path > ?"
+            params.append(lower)
+        sql += " ORDER BY f.canonical_path LIMIT ?"
+        params.append(limit + 1)
+        with self.get_cursor() as cursor:
+            rows = cursor.execute(sql, params).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [self._file_page_item(row) for row in rows]
+        next_cursor = rows[-1]["canonical_path"] if has_more and rows else None
+        return items, next_cursor
+
+    @staticmethod
+    def _file_page_item(row: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            tags = json.loads(row["tags"] or "[]")
+        except (TypeError, ValueError):
+            tags = []
+        return {
+            "id": row["file_uuid"],
+            "path": row["path"],
+            "filename": row["filename"],
+            "duration": row["duration"],
+            "sample_rate": row["sample_rate"],
+            "channels": row["channels"],
+            "file_size": row["file_size"],
+            "format": Path(row["path"]).suffix.lower().lstrip("."),
+            "tags": tags,
+            "source_fingerprint": row["source_fingerprint"],
+            "waveform_version": row["waveform_version"],
+            "waveform_state": row["waveform_state"] or "pending",
+            "audio_index_state": row["audio_index_state"] or "pending",
+            "text_index_state": row["text_index_state"] or "pending",
+        }
+
+    def get_folder_file_counts(self, project_id: str) -> Dict[str, int]:
+        """Count files directly inside each folder, from the covering keyword index."""
+        counts: Dict[str, int] = {}
+        with self.get_cursor() as cursor:
+            for row in cursor.execute("SELECT path FROM files WHERE project_id = ?", (project_id,)):
+                folder = parent_folder(row[0])
+                counts[folder] = counts.get(folder, 0) + 1
+        return counts
 
     def get_file_by_uuid(
         self, file_uuid: str, project_id: Optional[str] = None

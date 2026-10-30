@@ -95,6 +95,7 @@ from core.database import (
     canonicalize_path,
     canonical_path_is_within,
 )
+from core.folder_tree import build_folder_tree
 from core.websocket_manager import (
     get_ws_manager,
     reset_ws_manager,
@@ -2992,21 +2993,34 @@ async def get_indexed_files(
     project_id: Optional[str] = None,
     limit: int = Query(default=200, ge=1, le=500),
     cursor: Optional[int] = Query(default=None, ge=1),
+    folder: Optional[str] = None,
+    after: Optional[str] = None,
 ):
-    """获取工程内的分页元数据，波形按可见项另行加载。"""
+    """获取工程内的分页元数据，波形按可见项另行加载。
+
+    传入 folder 时按路径顺序返回该文件夹（含子文件夹）的文件，用 after 翻页。
+    """
     try:
         effective_project = project_id or getattr(config, 'CURRENT_PROJECT_ID', 'default')
         db_manager = get_db_manager()
         if not is_safe_project_id(effective_project) or not db_manager.get_project(effective_project):
             raise SoundBotAPIError("project_not_found", "工程不存在", status_code=404)
-        files, next_cursor = db_manager.get_files_cursor_page(
-            effective_project, limit=limit, before_id=cursor
-        )
+        if folder:
+            files, next_cursor = db_manager.get_folder_files_page(
+                effective_project, folder, limit=limit, after=after
+            )
+            # Counting a large folder takes seconds; the folder tree has the count.
+            total = None
+        else:
+            files, next_cursor = db_manager.get_files_cursor_page(
+                effective_project, limit=limit, before_id=cursor
+            )
+            total = db_manager.get_file_count(effective_project)
         for item in files:
             item["size"] = item.pop("file_size")
         return {
             "project_id": effective_project,
-            "total": db_manager.get_file_count(effective_project),
+            "total": total,
             "files": files,
             "next_cursor": next_cursor,
         }
@@ -3943,6 +3957,23 @@ async def delete_user_folder(
     except Exception as e:
         logger.error(f"删除用户文件夹失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/projects/{project_id}/folder-tree")
+async def get_imported_folder_tree(project_id: str):
+    """
+    从 SQLite 重建导入文件夹树（扫描时的结构只通过 WebSocket 发送一次）
+    """
+    db_manager = get_db_manager()
+    if not is_safe_project_id(project_id) or not db_manager.get_project(project_id):
+        raise SoundBotAPIError("project_not_found", "工程不存在", status_code=404)
+
+    def build():
+        roots = [mapping["folder_path"] for mapping in db_manager.get_imported_folder_mappings(project_id)]
+        return build_folder_tree(db_manager.get_folder_file_counts(project_id), roots)
+
+    # Reading every path takes about 2 s at 830k files; keep the event loop free.
+    return {"project_id": project_id, "roots": await asyncio.to_thread(build)}
 
 
 @app.get("/api/v1/projects/{project_id}/folder-mappings")

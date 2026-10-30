@@ -437,6 +437,41 @@ class APIContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('"api_key"', encoded)
         self.assertTrue(response["llm"]["config"]["openai"]["has_api_key"])
 
+    async def test_folder_tree_and_folder_pages_are_served_from_sqlite(self) -> None:
+        # The worker thread that builds the tree keeps its own SQLite handle.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            manager = DatabaseManager(str(Path(directory) / "folders.db"))
+            library = Path(directory) / "Library"
+            for relative in ("Doors/a.wav", "Doors/Metal/b.wav", "Wind/c.wav"):
+                path = library / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"RIFF-test")
+                manager.upsert_file(AudioFileRecord(path=str(path), filename=path.name))
+            for folder in (library, library / "Doors", library / "Doors" / "Metal", library / "Wind"):
+                manager.add_imported_folder_mapping(
+                    project_id="default", folder_path=str(folder),
+                    user_folder_id=None, folder_name=folder.name)
+
+            with mock.patch.object(main, "get_db_manager", return_value=manager):
+                tree = await main.get_imported_folder_tree("default")
+                folder_page = await main.get_indexed_files(
+                    project_id="default", limit=200, cursor=None,
+                    folder=str(library / "Doors"), after=None)
+                library_page = await main.get_indexed_files(
+                    project_id="default", limit=200, cursor=None, folder=None, after=None)
+                with self.assertRaises(main.SoundBotAPIError) as raised:
+                    await main.get_imported_folder_tree("missing-project")
+
+        root = tree["roots"][0]
+        self.assertEqual((root["path"], root["file_count"]), (str(library), 3))
+        self.assertEqual([child["name"] for child in root["children"]], ["Doors", "Wind"])
+        self.assertEqual(root["children"][0]["children"][0]["file_count"], 1)
+        self.assertEqual([item["filename"] for item in folder_page["files"]], ["a.wav", "b.wav"])
+        self.assertIsNone(folder_page["total"])
+        self.assertIn("size", folder_page["files"][0])
+        self.assertEqual(library_page["total"], 3)
+        self.assertEqual(raised.exception.status_code, 404)
+
     async def test_missing_project_preserves_404_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = DatabaseManager(str(Path(directory) / "project.db"))

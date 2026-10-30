@@ -84,6 +84,70 @@ class DatabaseV2Tests(unittest.TestCase):
         self.assertIn("sqlite_autoindex_file_artifacts_1", plan)
         self.assertNotIn("idx_file_artifacts_state", plan)
 
+    def test_folder_page_is_recursive_paged_and_ignores_prefix_siblings(self) -> None:
+        manager = DatabaseManager(str(self.root / "folder-page.db"))
+        library = self.root / "Library"
+        paths = [
+            library / "Doors" / "b.wav",
+            library / "Doors" / "Metal" / "a.wav",
+            library / "Doors" / "c.wav",
+            library / "DoorsExtra" / "sibling.wav",
+            library / "Wind" / "gust.wav",
+        ]
+        file_ids = {}
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"RIFF-test")
+            file_ids[path.name] = manager.upsert_file(
+                AudioFileRecord(path=str(path), filename=path.name), "default")
+        manager.set_artifact_state("default", file_ids["c.wav"], "waveform", "ready")
+
+        names, cursor, pages = [], None, 0
+        while True:
+            files, cursor = manager.get_folder_files_page(
+                "default", str(library / "Doors"), limit=2, after=cursor)
+            names += [item["filename"] for item in files]
+            pages += 1
+            if cursor is None:
+                break
+        self.assertEqual(names, ["b.wav", "c.wav", "a.wav"])
+        self.assertEqual(pages, 2)
+        files, _ = manager.get_folder_files_page("default", str(library / "Doors"))
+        states = {item["filename"]: item["waveform_state"] for item in files}
+        self.assertEqual(states["c.wav"], "ready")
+        self.assertEqual(states["b.wav"], "pending")
+        self.assertNotIn("peaks", files[0])
+        self.assertEqual(manager.get_folder_files_page("default", str(library / "Doors" / "Metal"))[0][0]["filename"], "a.wav")
+
+        counts = manager.get_folder_file_counts("default")
+        manager._get_connection().close()
+        manager._local.conn = None
+        self.assertEqual(counts[str(library / "Doors")], 2)
+        self.assertEqual(counts[str(library / "Doors" / "Metal")], 1)
+        self.assertEqual(sum(counts.values()), len(paths))
+
+    def test_folder_page_seeks_the_canonical_path_index(self) -> None:
+        manager = DatabaseManager(str(self.root / "folder-plan.db"))
+        audio = self.root / "Pack" / "hit.wav"
+        audio.parent.mkdir()
+        audio.write_bytes(b"RIFF-test")
+        manager.upsert_file(AudioFileRecord(path=str(audio), filename=audio.name), "default")
+        connection = manager._get_connection()
+        statements = []
+        connection.set_trace_callback(statements.append)
+        try:
+            manager.get_folder_files_page("default", str(audio.parent), after="")
+            query = next(sql for sql in statements if "FROM files f" in sql)
+            plan = " ".join(str(step[-1]) for step in connection.execute(
+                "EXPLAIN QUERY PLAN " + query).fetchall())
+        finally:
+            connection.set_trace_callback(None)
+            connection.close()
+            manager._local.conn = None
+        self.assertRegex(plan, r"(idx_files_canonical_path|sqlite_autoindex_files_1) \(project_id=\? AND canonical_path>")
+        self.assertNotIn("TEMP B-TREE", plan)
+        self.assertIn("sqlite_autoindex_file_artifacts_1", plan)
+
     def test_fresh_database_creates_artifact_state_and_metadata_page(self) -> None:
         manager = DatabaseManager(str(self.root / "fresh.db"))
         audio = self.root / "中文 %_ tone.wav"

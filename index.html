@@ -1189,6 +1189,23 @@
             }
         }
 
+        // 从 SQLite 重建导入文件夹树（扫描时的结构只通过 WebSocket 发送一次，重启后会丢失）
+        async function loadImportedFolderTree() {
+            try {
+                const result = await rendererProjects.getFolderTree(currentProject.id);
+                importedFolderData = (result?.roots || []).map(convertBackendFolderToFrontend);
+                // 大型音效库有上万个子文件夹，默认只展开根目录
+                const collapse = node => node.children.forEach(child => {
+                    if (!folderExpandedState.has(child.fullPath)) folderExpandedState.set(child.fullPath, false);
+                    collapse(child);
+                });
+                importedFolderData.forEach(collapse);
+                console.log('[FOLDER] 加载导入文件夹树:', importedFolderData.length);
+            } catch (error) {
+                console.error('[FOLDER] 加载导入文件夹树失败:', error);
+            }
+        }
+
         // 创建用户文件夹
         async function createUserFolder(name, description = '', color = '#3b82f6') {
             try {
@@ -1303,6 +1320,12 @@
             }
 
             if (childrenContainer) {
+                if (newState && childrenContainer.renderPendingChildren) {
+                    const renderPendingChildren = childrenContainer.renderPendingChildren;
+                    childrenContainer.renderPendingChildren = null;
+                    renderPendingChildren();
+                    lucide.createIcons();
+                }
                 childrenContainer.style.display = newState ? 'block' : 'none';
                 console.log('[FOLDER] 子容器显示状态:', childrenContainer.style.display);
             } else {
@@ -1516,14 +1539,17 @@
                 // 如果点击的是展开按钮，不执行筛选
                 if (e.target.closest('.folder-toggle')) return;
 
+                // 再次点击已选中的文件夹则回到全部文件
+                const wasActive = div.classList.contains('active');
                 document.querySelectorAll('#folderTree .sidebar-item').forEach(item => item.classList.remove('active'));
+                if (wasActive) {
+                    loadFilesFromDatabase();
+                    return;
+                }
                 div.classList.add('active');
 
-                // 使用相对路径筛选（包含所有子层级）
-                const filtered = soundData.filter(s => {
-                    return isSameOrChildPath(s.folderPath, folder.path);
-                });
-                renderSoundList('', filtered);
+                // 已加载的列表只是全库的一页，所以由后端按路径加载该文件夹（含子文件夹）
+                loadFilesFromDatabase({ folder: folder.fullPath, folderTotal: folder.count || 0 });
             });
 
             // 右键菜单
@@ -1538,8 +1564,15 @@
             childrenContainer.style.marginLeft = '8px';
             childrenContainer.style.display = expanded ? 'block' : 'none';
 
-            // 渲染子文件夹（递归）
-            if (hasChildren) {
+            // 渲染子文件夹（递归）；折叠的文件夹在首次展开时才创建，避免一次渲染上万个节点
+            if (hasChildren && !expanded) {
+                childrenContainer.renderPendingChildren = () => {
+                    folder.children.forEach(child => {
+                        childrenContainer.appendChild(createImportedFolderItem(child, level + 1, false));
+                    });
+                };
+                div.appendChild(childrenContainer);
+            } else if (hasChildren) {
                 folder.children.forEach(child => {
                     childrenContainer.appendChild(createImportedFolderItem(child, level + 1, false));
                 });
@@ -3807,6 +3840,7 @@
                     // 重新加载该工程的文件和文件夹
                     await loadFilesFromDatabase();
                     await loadUserFolders();
+                    await loadImportedFolderTree();
 
                     // 刷新UI
                     renderFolderTree();
@@ -4377,7 +4411,7 @@
                 refreshProjectIndexStatus();
 
                 // 重新加载文件夹结构和映射
-                loadUserFolders().then(() => {
+                Promise.all([loadUserFolders(), loadImportedFolderTree()]).then(() => {
                     renderFolderTree();
                     lucide.createIcons();
                 });
@@ -4399,24 +4433,30 @@
         let fileListLoading = false;
         let fileListTotal = 0;
         let fileListLoadToken = 0;
+        // 选中导入文件夹时，按路径从后端分页加载该文件夹（含子文件夹）的文件
+        let fileListFolder = null;
+        let fileListFolderTotal = 0;
 
-        async function loadFilesFromDatabase({ reset = true } = {}) {
+        async function loadFilesFromDatabase({ reset = true, folder = null, folderTotal = 0 } = {}) {
             if ((fileListLoading && !reset) || (!reset && !fileListNextCursor)) return;
             const loadToken = reset ? ++fileListLoadToken : fileListLoadToken;
             const projectId = currentProject?.id || 'default';
             if (reset) {
                 fileListNextCursor = null;
                 fileListTotal = 0;
+                fileListFolder = folder;
+                fileListFolderTotal = folderTotal;
             }
             fileListLoading = true;
             const cursor = reset ? null : fileListNextCursor;
             const startTime = Date.now();
-            console.log('[Library] 加载文件页:', { reset, cursor });
+            console.log('[Library] 加载文件页:', { reset, cursor, folder: fileListFolder });
 
             try {
                 const result = await rendererProjects.listFiles(projectId, {
                     limit: 200,
-                    cursor
+                    cursor,
+                    folder: fileListFolder
                 });
                 if (loadToken !== fileListLoadToken || projectId !== currentProject?.id) return null;
                 const files = Array.isArray(result?.files) ? result.files : [];
@@ -4447,7 +4487,9 @@
                     soundData = soundData.concat(mapped.filter(sound => !existing.has(sound.fileId || sound.filePath)));
                 }
                 fileListNextCursor = result?.next_cursor || null;
-                fileListTotal = Number(result?.total || soundData.length);
+                fileListTotal = result?.total != null
+                    ? Number(result.total)
+                    : (fileListFolderTotal || soundData.length);
                 updateCategoryData();
                 renderSoundList();
                 console.log('[Library] 文件页加载完成:', {
@@ -4536,6 +4578,7 @@
                     if (!projectLoaded) {
                         await loadFilesFromDatabase();
                         await loadUserFolders();
+                        await loadImportedFolderTree();
                         renderFolderTree();
                         updateCategoryData();
                         renderSoundList();

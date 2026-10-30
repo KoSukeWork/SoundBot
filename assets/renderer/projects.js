@@ -55,6 +55,7 @@
             projectPath(projectId, `/folders/${encodeURIComponent(folderId)}`)
         ),
         listFolderMappings: projectId => api().get(projectPath(projectId, '/folder-mappings')),
+        getFolderTree: projectId => api().get(projectPath(projectId, '/folder-tree')),
         updateFolderMapping: (projectId, folderPath, userFolderId) => {
             const query = userFolderId ? `?user_folder_id=${encodeURIComponent(userFolderId)}` : '';
             return api().post(
@@ -66,7 +67,12 @@
                 project_id: projectId || 'default',
                 limit: String(options.limit || 200)
             });
-            if (options.cursor) query.set('cursor', String(options.cursor));
+            if (options.folder) {
+                query.set('folder', String(options.folder));
+                if (options.cursor) query.set('after', String(options.cursor));
+            } else if (options.cursor) {
+                query.set('cursor', String(options.cursor));
+            }
             return api().get(`/api/v1/files?${query.toString()}`);
         },
         indexStatus: projectId => api().get(projectPath(projectId, '/index/status')),
